@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test the plugin and its script
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pytest
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --quiet "pytest>=8"
+
+      - name: Test
+        run: .venv/bin/python -m pytest
+
+  validate:
+    name: claude plugin validate --strict
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The version the DocuGen box image pins (Dockerfile.docugen in claude-docker-ecs); change both together.
+      - name: Install Claude Code
+        run: npm install --no-audit --no-fund --prefix "$RUNNER_TEMP/cc" @anthropic-ai/claude-code@2.1.294
+
+      - name: Validate the plugin
+        run: |
+          HOME="$(mktemp -d)" "$RUNNER_TEMP/cc/node_modules/.bin/claude" plugin validate . --strict
