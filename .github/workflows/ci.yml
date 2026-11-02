@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   test:
-    name: Test the plugin and its script
+    name: Test the validators, the plugin and its script
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -42,10 +42,10 @@ jobs:
         with:
           persist-credentials: false
 
-      # The version the DocuGen box image pins (Dockerfile.docugen in claude-docker-ecs); change both together.
+      # The Claude Code version the DocuGen box image pins; change both together.
       - name: Install Claude Code
         run: npm install --no-audit --no-fund --prefix "$RUNNER_TEMP/cc" @anthropic-ai/claude-code@2.1.294
 
       - name: Validate the plugin
         run: |
-          HOME="$(mktemp -d)" "$RUNNER_TEMP/cc/node_modules/.bin/claude" plugin validate . --strict
+          HOME="$(mktemp -d)" "$RUNNER_TEMP/cc/node_modules/.bin/claude" plugin validate plugins/docugen-box --strict

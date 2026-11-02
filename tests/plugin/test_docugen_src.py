@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "docugen_src.py"
+SCRIPT = Path(__file__).resolve().parents[2] / "plugins" / "docugen-box" / "scripts" / "docugen_src.py"
 
 
 @pytest.fixture

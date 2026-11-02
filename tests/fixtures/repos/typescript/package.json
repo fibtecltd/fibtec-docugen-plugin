@@ -1,0 +1,1 @@
+{"name": "sessions-ts", "version": "1.0.0", "private": true, "scripts": {"build": "tsc"}, "dependencies": {"express": "^4.19.0"}}
