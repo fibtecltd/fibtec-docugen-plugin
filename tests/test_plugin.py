@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -42,14 +44,38 @@ def test_manifest_is_valid() -> None:
     assert m["description"] and m["author"]["name"]
 
 
+# Directories that are development or VCS state, never plugin content: the CI job creates .venv inside the checkout.
+NOT_PLUGIN_CONTENT = {".git", ".venv", "__pycache__", ".pytest_cache"}
+
+
+def plugin_files() -> list[Path]:
+    """Every file of the plugin as it would be fetched into the image, leaving out development state."""
+    out: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        dirnames[:] = sorted(d for d in dirnames if d not in NOT_PLUGIN_CONTENT)
+        out.extend(Path(dirpath) / f for f in sorted(filenames))
+    return out
+
+
 def test_the_plugin_carries_no_hooks_mcp_servers_agents_or_commands() -> None:
     """Plugin hooks run commands and MCP servers start processes; in the box neither is wanted, and a
     plugin that quietly grew one would be loaded with the session's credentials in its environment."""
-    top = {p.name for p in ROOT.iterdir() if not p.name.startswith(".git")}
-    assert top <= {".claude-plugin", "skills", "scripts", "tests", "README.md", ".gitignore", "pyproject.toml",
-                   "pytest.ini", "__pycache__", ".pytest_cache"}, top
-    assert not list(ROOT.glob("**/hooks.json")) and not list(ROOT.glob("**/.mcp.json"))
+    top = {p.name for p in ROOT.iterdir() if p.name not in NOT_PLUGIN_CONTENT}
+    assert top <= {".claude-plugin", ".github", ".gitignore", "skills", "scripts", "tests", "README.md",
+                   "pyproject.toml", "pytest.ini"}, top
+    names = {p.name for p in plugin_files()}
+    assert "hooks.json" not in names and ".mcp.json" not in names
     assert {p.name for p in (ROOT / ".claude-plugin").iterdir()} == {"plugin.json"}
+
+
+def test_the_development_state_check_ignores_a_venv_in_the_checkout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The CI job creates .venv in the checkout, and its packages contain files with any name."""
+    (tmp_path / ".venv" / "lib").mkdir(parents=True)
+    (tmp_path / ".venv" / "lib" / "hooks.json").write_text("{}")
+    (tmp_path / "skills").mkdir()
+    (tmp_path / "skills" / "x.md").write_text("x")
+    monkeypatch.setattr(sys.modules[__name__], "ROOT", tmp_path)
+    assert [p.name for p in plugin_files()] == ["x.md"]
 
 
 def test_there_are_the_two_skills() -> None:
