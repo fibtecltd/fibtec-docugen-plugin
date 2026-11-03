@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from docugen.box import status
+
 ROOT = Path(__file__).resolve().parents[2] / "plugins" / "docugen-box"  # the plugin; the repository root is not one
 SKILLS = sorted((ROOT / "skills").glob("*/SKILL.md"))
 
@@ -18,11 +20,10 @@ ALLOWED_COMMANDS = {"docugen-src", "docugen-verify", "mmdc", "plantuml"}
 DOCUGEN_SRC_SUBCOMMANDS = {"tree", "find", "grep", "manifest"}
 DOCUGEN_VERIFY_SUBCOMMANDS = {"markdown", "svg", "diagram", "secrets"}  # model-facing subset of docugen.verify
 
-# What the box wrapper will accept as the only output of a session. Changing either list changes the contract
-# with the box wrapper: update both together.
-STATUS_WORDS = ["STARTED", "INDEXED", "DRAFTING", "VALIDATING", "REPAIRING", "PACKAGING", "DONE", "FAILED",
-                "INJECTION_SUSPECTED", "LIMIT_REACHED"]
-FAILURE_CODES = ["NO_SOURCE", "TOO_LARGE", "VALIDATION", "BUDGET", "DENIED", "INTERNAL"]
+# What the box's supervisor lets out of a session: defined once, in docugen.box.status. The session skill tells the
+# model the same words, and test_status_vocabulary_matches_the_contract requires the two to agree.
+STATUS_WORDS = list(status.WORDS)
+FAILURE_CODES = list(status.FAILURE_CODES)
 
 
 def frontmatter(path: Path) -> dict[str, str]:
