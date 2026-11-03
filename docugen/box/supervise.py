@@ -194,16 +194,24 @@ class UsageError(Exception):
     """The box was started wrongly (no ``-p``, no agent to run). The message is fixed text, never session content."""
 
 
-def execute(argv: list[str], *, out: IO[str], env: dict[str, str] | None = None) -> tuple[Verdict, dict[str, Any] | None]:
+def execute(argv: list[str], *, out: IO[str], env: dict[str, str] | None = None,
+            user: tuple[int, int] | None = None) -> tuple[Verdict, dict[str, Any] | None]:
     """Run the agent, print its progress words to ``out`` as they arrive, and return how the session really ended and the
     agent's final ``result`` event. The usage and terminal lines are not printed: ``finish`` prints them, after whatever
-    the caller still has to do (the session flow packages the output in between)."""
+    the caller still has to do (the session flow packages the output in between).
+
+    With ``user=(uid, gid)`` the agent is started as that user and with no supplementary groups (this needs root). It
+    cannot then read this process's memory or environment, and files this process owns stay out of its reach."""
     if not argv or not any(a in ("-p", "--print") for a in argv[1:]):
         raise UsageError("the agent must be started headless (-p PROMPT)")
     child_env = {k: v for k, v in (os.environ if env is None else env).items() if k != "PYTHONPATH"}
+    identity: dict[str, Any] = {} if user is None else {"user": user[0], "group": user[1], "extra_groups": []}
     try:
         proc = subprocess.Popen([*argv, *FORCED_ARGS], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, env=child_env, start_new_session=True)
+                                stderr=subprocess.DEVNULL, env=child_env, start_new_session=True, **identity)
+    except PermissionError:
+        # The first thing a deployment learns about whether the agent can be switched to its own user.
+        raise UsageError("cannot start the agent: permission denied (switching to the agent user?)") from None
     except OSError:
         raise UsageError("cannot start the agent") from None
     assert proc.stdout is not None  # noqa: S101 - stdout=PIPE

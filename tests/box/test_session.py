@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 
 from docugen.box import session, transfer
+from docugen.box import supervise as supervise_module
 from docugen.box.session import ConfigError, OutputSummary, SessionConfig, StepFailed, load_tools
 from docugen.verify.archive_safe import Limits as RealLimits
 from docugen.verify.manifest import MANIFEST_PATH, check_manifest, check_tree
@@ -83,11 +84,12 @@ class World:
         self.environ["FAKE_STREAM"] = str(stream_file(self.tmp, events))
         self.environ["FAKE_EXIT"] = str(agent_exit)
 
-    def run(self, *, argv: list[str] | None = None, tools: str | None = None) -> tuple[int, list[str]]:
+    def run(self, *, argv: list[str] | None = None, tools: str | None = None, scratch: str | None = None) -> tuple[int, list[str]]:
         out = io.StringIO()
         argv = argv if argv is not None else [sys.executable, str(FAKE), "-p", "go"]
         rc = session.run_session(argv, self.environ, src_dir=str(self.src), out_dir=str(self.out), work_dir=str(self.work),
-                                 tools_file=tools or str(self.tmp / "no-tools.json"), out=out, now=NOW)
+                                 tools_file=tools or str(self.tmp / "no-tools.json"), out=out, now=NOW, drop_privileges=False,
+                                 scratch_dir=scratch)
         return rc, out.getvalue().splitlines()
 
 
@@ -147,7 +149,11 @@ def test_a_good_session_fetches_runs_packs_and_uploads(world) -> None:
 
     # what was uploaded is what the validators accept, against the source the box extracted
     assert check_tree(str(w.out)) == []
-    assert check_manifest(json.loads((w.out / MANIFEST_PATH).read_text()), root=str(w.out), source_root=str(w.src)) == []
+    assert check_manifest(manifest, root=str(w.out), source_root=str(w.src)) == []
+
+    # the supervisor wrote nothing in the agent's tree: not the manifest, not a temporary file
+    written = {str(p.relative_to(w.out)) for p in w.out.rglob("*") if p.is_file()}
+    assert written == set(DOCS) and not (w.out / MANIFEST_PATH).exists()
 
 
 def test_the_agent_never_sees_the_session_secrets(world) -> None:
@@ -342,6 +348,8 @@ def test_an_agent_that_leaves_a_forged_manifest_gets_it_replaced(world) -> None:
     assert rc == 0
     (_, payload), = w.backend.uploads
     with tarfile.open(fileobj=io.BytesIO(payload)) as tar:
+        names = tar.getnames()
+        assert names.count(MANIFEST_PATH) == 1                            # not the agent's and ours side by side
         assert b"forged" not in tar.extractfile(MANIFEST_PATH).read()  # type: ignore[union-attr]
 
 
@@ -408,6 +416,7 @@ def test_an_unexpected_exception_is_a_failed_session_and_prints_nothing_of_itsel
     assert captured.err == "" and SECRET not in "".join(lines) and "secret-customer-file" not in "".join(lines)
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="as root the agent is switched to another user: see the root-only test below")
 def test_the_command_line_entry_point(world, tmp_path: Path) -> None:
     w = world()
     env = {**supervisor_env(w.environ), "DOCUGEN_SRC_DIR": str(w.src), "DOCUGEN_OUT_DIR": str(w.out),
@@ -442,3 +451,225 @@ def test_the_output_line_is_numbers_only() -> None:
     assert StepFailed("VALIDATION").code == "VALIDATION"
     with pytest.raises(AssertionError):
         StepFailed("SOMETHING_ELSE")
+
+
+# ── who the agent is ────────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("environ,euid,expected", [
+    ({}, 1000, None), ({}, 1, None), ({"DOCUGEN_AGENT_UID": "0"}, 1000, None),           # not root: nobody to switch to
+    ({}, 0, session.AgentIdentity(1001, 1001)),
+    ({"DOCUGEN_AGENT_UID": "2000", "DOCUGEN_AGENT_GID": "3000"}, 0, session.AgentIdentity(2000, 3000)),
+    ({"DOCUGEN_AGENT_UID": "65535", "DOCUGEN_AGENT_GID": "1"}, 0, session.AgentIdentity(65535, 1)),
+    ({"DOCUGEN_AGENT_HOME": "/opt/box-test/home"}, 0, session.AgentIdentity(1001, 1001, "/opt/box-test/home")),
+    ({"DOCUGEN_AGENT_HOME": "/"}, 0, session.AgentIdentity(1001, 1001, "/")),
+])
+def test_the_agent_is_switched_to_its_own_user_only_when_this_process_is_root(environ: dict, euid: int, expected: object) -> None:
+    assert session.agent_identity(environ, euid) == expected
+
+
+@pytest.mark.parametrize("bad", ["0", "00", "-1", "+5", "abc", "", " 5", "5 ", "65536", "1e3", "0x10", "\uff11\uff12\uff13", "١٢٣"])
+@pytest.mark.parametrize("name", ["DOCUGEN_AGENT_UID", "DOCUGEN_AGENT_GID"])
+def test_the_agent_never_runs_as_root_and_never_as_a_malformed_id(name: str, bad: str) -> None:
+    with pytest.raises(ConfigError) as exc:
+        session.agent_identity({name: bad}, 0)
+    assert name in str(exc.value) and (bad == "" or bad not in str(exc.value))   # the message never repeats the value
+
+
+@pytest.mark.parametrize("bad", ["", "home/claude", "~/claude", "/home/../root", "/home/c laude", "/home/claude\n", "/h\x00ome",
+                                 "/home/cläude", "/" + "a" * 300, "$HOME", "/home/$USER"])
+def test_the_agent_home_is_a_plain_absolute_path(bad: str) -> None:
+    with pytest.raises(ConfigError) as exc:
+        session.agent_identity({"DOCUGEN_AGENT_HOME": bad}, 0)
+    assert str(exc.value) == "DOCUGEN_AGENT_HOME must be a plain absolute path"
+
+
+def test_a_session_run_as_root_gives_the_agent_the_configured_home(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    w = world()
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(session.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(session, "prepare_scratch", lambda path: None)
+    monkeypatch.setattr(session, "pre_step", lambda config, src, scratch: None)
+
+    def execute(argv: list[str], *, out: Any, env: dict[str, str], user: Any) -> tuple[Any, None]:
+        seen.update(env)
+        return session.Verdict("FAILED", "INTERNAL", 1), None
+
+    monkeypatch.setattr(session.supervise, "execute", execute)
+    w.environ.update(DOCUGEN_AGENT_HOME="/opt/somewhere/home", HOME="/root")
+    session.run_session([sys.executable, str(FAKE), "-p", "go"], w.environ, src_dir=str(w.src), out_dir=str(w.out),
+                        work_dir=str(w.work), out=io.StringIO())
+    assert seen["HOME"] == "/opt/somewhere/home" and seen["USER"] == "claude"
+
+
+def test_a_root_session_switches_the_agent_and_keeps_its_own_files_apart(world, monkeypatch: pytest.MonkeyPatch,
+                                                                         tmp_path: Path) -> None:
+    """The decisions, without needing to be root: who the agent is, what it is given, where this process keeps its own files."""
+    w = world()
+    calls: dict[str, Any] = {}
+    monkeypatch.setattr(session.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(session, "prepare_scratch", lambda path: calls.setdefault("scratch", path))
+    monkeypatch.setattr(session, "pre_step", lambda config, src, scratch: calls.setdefault("pre_step_scratch", scratch))
+    monkeypatch.setattr(session, "make_read_only", lambda path: calls.setdefault("read_only", path))
+
+    def execute(argv: list[str], *, out: Any, env: dict[str, str], user: Any) -> tuple[Any, None]:
+        calls.update(env=env, user=user)
+        return session.Verdict("FAILED", "INTERNAL", 1), None
+
+    monkeypatch.setattr(session.supervise, "execute", execute)
+    w.environ.update(HOME="/root", USER="root")
+    out = io.StringIO()
+    rc = session.run_session([sys.executable, str(FAKE), "-p", "go"], w.environ, src_dir=str(w.src), out_dir=str(w.out),
+                             work_dir=str(w.work), out=out)               # drop_privileges left at its default
+    assert rc == 1
+    assert calls["user"] == (1001, 1001)
+    assert calls["scratch"] == calls["pre_step_scratch"] == session.DEFAULT_SCRATCH != str(w.work)   # not where the agent writes
+    assert (calls["env"]["HOME"], calls["env"]["USER"], calls["env"]["LOGNAME"]) == ("/home/claude", "claude", "claude")
+    assert not [k for k in calls["env"] if k.startswith("DOCUGEN_")] and calls["env"]["ANTHROPIC_API_KEY"] == "sk-not-real"
+    assert "read_only" not in calls                                     # root-owned already: nothing to chmod
+
+
+def test_a_root_session_for_a_misconfigured_agent_id_does_not_start(world, monkeypatch: pytest.MonkeyPatch,
+                                                                    capsys: pytest.CaptureFixture[str]) -> None:
+    w = world()
+    monkeypatch.setattr(session.os, "geteuid", lambda: 0)
+    w.environ["DOCUGEN_AGENT_UID"] = "0"
+    out = io.StringIO()
+    rc = session.run_session([sys.executable, str(FAKE), "-p", "go"], w.environ, src_dir=str(w.src), out_dir=str(w.out),
+                             work_dir=str(w.work), out=out)
+    assert rc == 2 and out.getvalue() == "" and w.backend.gets == 0
+    assert capsys.readouterr().err == "docugen-box: DOCUGEN_AGENT_UID must be a user or group id from 1 to 65535: the agent never runs as root\n"
+
+
+def test_the_agent_is_started_as_the_user_with_no_supplementary_groups(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, Any] = {}
+
+    def popen(*args: Any, **kwargs: Any) -> None:
+        seen.update(kwargs)
+        raise PermissionError
+
+    monkeypatch.setattr(supervise_module.subprocess, "Popen", popen)
+    with pytest.raises(supervise_module.UsageError) as exc:
+        supervise_module.execute(["claude", "-p", "go"], out=io.StringIO(), env={}, user=(1001, 1002))
+    assert (seen["user"], seen["group"], seen["extra_groups"]) == (1001, 1002, [])
+    assert str(exc.value) == "cannot start the agent: permission denied (switching to the agent user?)"
+    seen.clear()
+    with pytest.raises(supervise_module.UsageError):
+        supervise_module.execute(["claude", "-p", "go"], out=io.StringIO(), env={})
+    assert "user" not in seen and "group" not in seen and "extra_groups" not in seen
+
+
+def test_a_refused_switch_is_reported_as_started_wrongly_with_a_fixed_message(world, monkeypatch: pytest.MonkeyPatch,
+                                                                              capsys: pytest.CaptureFixture[str]) -> None:
+    w = world()
+
+    def popen(*_a: Any, **_k: Any) -> None:
+        raise PermissionError("/secret/path/of/the/customer")
+
+    monkeypatch.setattr(supervise_module.subprocess, "Popen", popen)
+    rc, lines = w.run()
+    assert (rc, lines) == (2, [])
+    assert capsys.readouterr().err == "docugen-box: cannot start the agent: permission denied (switching to the agent user?)\n"
+
+
+# ── what this process keeps for itself ──────────────────────────────────────────────────────────────
+
+def test_the_scratch_directory_is_created_private_when_missing(world, tmp_path: Path) -> None:
+    w = world()
+    scratch = tmp_path / "new" / "scratch"
+    rc, _ = w.run(scratch=str(scratch))
+    assert rc == 0 and (scratch.stat().st_mode & 0o777) == 0o700 and list(scratch.iterdir()) == []
+    assert list(w.work.iterdir()) == []      # the agent's own work directory was not used for it
+
+
+@pytest.mark.parametrize("make", ["symlink", "loose-mode", "a-file"])
+def test_a_scratch_directory_that_is_not_private_ends_the_session_before_anything_is_fetched(world, tmp_path: Path, make: str) -> None:
+    w = world()
+    target = tmp_path / "scratch"
+    if make == "symlink":
+        real = tmp_path / "real"
+        real.mkdir(mode=0o700)
+        target.symlink_to(real)
+    elif make == "loose-mode":
+        target.mkdir()
+        target.chmod(0o755)
+    else:
+        target.write_text("not a directory")
+    rc, lines = w.run(scratch=str(target))
+    assert (rc, lines) == (1, ["STATUS: FAILED INTERNAL"]) and w.backend.gets == 0 and not w.record.exists()
+
+
+def test_the_supervisor_follows_no_link_the_agent_leaves_where_it_would_write(world, tmp_path: Path) -> None:
+    """A root process that wrote the manifest in the agent's tree would follow these. This one writes nothing there."""
+    w = world()
+    victim = tmp_path / "victim.txt"
+    victim.write_text("precious")
+    w.environ["FAKE_SYMLINKS"] = json.dumps({"docs/.docugen/manifest.json": str(victim), "docs/.docugen/manifest.json.tmp": str(victim)})
+    rc, lines = w.run()
+    assert rc == 1 and lines[-1] == "STATUS: FAILED VALIDATION" and w.backend.uploads == []
+    assert victim.read_text() == "precious"
+
+
+def test_not_being_root_makes_the_source_read_only_by_mode(world) -> None:
+    w = world()
+    rc, _ = w.run()
+    assert rc == 0
+    for path in [w.src, *w.src.rglob("*")]:
+        assert not path.lstat().st_mode & 0o222, path
+    assert (w.src / "app" / "api.py").read_text() == SOURCE_FILES["app/api.py"]   # still readable
+
+
+# ── the real thing: root, and an agent that is somebody else ────────────────────────────────────────
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="starting the agent as another user needs root")
+def test_as_root_the_agent_really_runs_as_another_user_and_cannot_reach_what_is_not_its_own() -> None:
+    import shutil
+    import tempfile
+    uid, gid = 31337, 31338
+    base = Path(tempfile.mkdtemp(prefix="docugen-root-"))
+    try:
+        base.chmod(0o755)
+        for name in ("src", "scratch"):
+            (base / name).mkdir(mode=0o700 if name == "scratch" else 0o755)
+        for name in ("out", "work", "rec"):
+            (base / name).mkdir(mode=0o755)
+            os.chown(base / name, uid, gid)
+        (base / "work").chmod(0o700)
+        fake = base / "fake_agent.py"
+        shutil.copy(FAKE, fake)
+        fake.chmod(0o644)
+        stream = stream_file(base, [event_assistant("STATUS: DRAFTING"), event_result("STATUS: DONE")])
+        stream.chmod(0o644)
+
+        with serve(Backend(tar_bytes(SOURCE_FILES))) as (url, hits):
+            environ = {
+                "PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/root", "PYTHONPATH": str(ROOT), "ANTHROPIC_API_KEY": "sk-not-real",
+                "DOCUGEN_SESSION_ID": SESSION_ID, "DOCUGEN_SOURCE_URL": f"{url}/source?sig={SECRET}", "DOCUGEN_OUT_URL": f"{url}/upload",
+                "DOCUGEN_OUT_FIELDS": json.dumps({"key": "k", "policy": SECRET}), "DOCUGEN_SOURCE_KIND": "github",
+                "DOCUGEN_SOURCE_COMMIT": COMMIT, "DOCUGEN_AGENT_UID": str(uid), "DOCUGEN_AGENT_GID": str(gid),
+                "DOCUGEN_SRC_DIR": str(base / "src"), "DOCUGEN_OUT_DIR": str(base / "out"), "DOCUGEN_WORK_DIR": str(base / "work"),
+                "DOCUGEN_SCRATCH_DIR": str(base / "scratch"), "DOCUGEN_TOOLS_FILE": str(base / "none.json"),
+                "FAKE_STREAM": str(stream), "FAKE_OUT_DIR": str(base / "out"), "FAKE_WRITE": json.dumps(DOCS),
+                "FAKE_RECORD": str(base / "rec" / "agent.json"),
+                "FAKE_PROBE": json.dumps({"src": str(base / "src"), "scratch": str(base / "scratch")}),
+            }
+            done = subprocess.run([sys.executable, "-P", "-m", "docugen.box", "--session", "--", "/usr/bin/python3", str(fake), "-p", "go"],
+                                  env=environ, capture_output=True, text=True, cwd=str(base / "out"), timeout=120)
+            uploads = hits.requests
+
+        lines = done.stdout.splitlines()
+        assert done.returncode == 0 and done.stderr == "", (done.stdout, done.stderr)
+        assert lines[0] == "STATUS: DRAFTING" and lines[1] == "STATUS: PACKAGING" and lines[-1] == "STATUS: DONE"
+        assert [r[0] for r in uploads] == ["GET", "POST"]
+
+        record = json.loads((base / "rec" / "agent.json").read_text())
+        assert (record["uid"], record["gid"], record["groups"]) == (uid, gid, [])
+        assert record["home"] == "/home/claude" and not [n for n in record["env"] if n.startswith("DOCUGEN_")]
+        assert record["probe"] == {"parent_environ": "denied", "write_src": "denied", "list_scratch": "denied"}
+
+        # ownership says the same: the source is root's, the output is the agent's, and nothing in it is the supervisor's
+        assert (base / "src" / "app" / "api.py").stat().st_uid == 0
+        owners = {p.stat().st_uid for p in (base / "out").rglob("*")}
+        assert owners == {uid}, owners
+        assert list((base / "scratch").iterdir()) == []
+    finally:
+        shutil.rmtree(base, ignore_errors=True)

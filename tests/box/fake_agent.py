@@ -11,6 +11,7 @@ FAKE_BACKGROUND  start a background process that keeps standard output open for 
 FAKE_OUT_DIR  where FAKE_WRITE and FAKE_SYMLINKS put their files (the real agent works in the output directory)
 FAKE_WRITE    JSON object of relative path to text: files the session writes
 FAKE_SYMLINKS JSON object of relative path to target: symbolic links the session leaves behind
+FAKE_PROBE    JSON object {"src": dir, "scratch": dir}: what the agent tries to touch, recorded in FAKE_RECORD under "probe"
 """
 
 import json
@@ -20,12 +21,34 @@ import sys
 import time
 
 
+def attempt(call) -> str:  # noqa: ANN001
+    try:
+        call()
+    except PermissionError:
+        return "denied"
+    except OSError as exc:
+        return f"error:{exc.errno}"
+    return "allowed"
+
+
+def probe() -> dict:
+    """What this process can reach: its parent's environment, a write into the source, the supervisor's scratch directory."""
+    targets = json.loads(os.environ.get("FAKE_PROBE", "{}"))
+    out = {"parent_environ": attempt(lambda: open(f"/proc/{os.getppid()}/environ", "rb").read(1))}
+    if "src" in targets:
+        out["write_src"] = attempt(lambda: open(os.path.join(targets["src"], "planted.txt"), "w").close())
+    if "scratch" in targets:
+        out["list_scratch"] = attempt(lambda: os.listdir(targets["scratch"]))
+    return out
+
+
 def main() -> int:
     record = os.environ.get("FAKE_RECORD")
     if record:
         with open(record, "w") as fh:
             json.dump({"argv": sys.argv[1:], "env": sorted(os.environ), "stdin": sys.stdin.read(),
-                       "pgid_is_own": os.getpgrp() == os.getpid()}, fh)
+                       "pgid_is_own": os.getpgrp() == os.getpid(), "uid": os.getuid(), "gid": os.getgid(),
+                       "groups": os.getgroups(), "home": os.environ.get("HOME"), "probe": probe()}, fh)
     root = os.environ.get("FAKE_OUT_DIR", "")
     for rel, text in json.loads(os.environ.get("FAKE_WRITE", "{}")).items():
         path = os.path.join(root, rel)

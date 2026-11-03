@@ -128,9 +128,9 @@ does not have. A diagram and its rendering take the sources of the Markdown docu
 2. **The agent**, through the supervisor, with every `DOCUGEN_*` variable removed from its environment: it never holds a
    presigned URL.
 3. **Post-step**, only if the session ended `DONE` or `LIMIT_REACHED`: check the output tree (`docs/**`, fixed extensions,
-   no links or executables, at least one document), write the provenance manifest and check it against the source, pack
-   `docs/` into one reproducible tar and upload it. A `LIMIT_REACHED` session still packs what it has; whether partial
-   output is delivered is the deliver step's decision.
+   no links or executables, at least one document), build the provenance manifest and check it against the source, pack
+   `docs/` and the manifest into one reproducible tar and upload it. A `LIMIT_REACHED` session still packs what it has;
+   whether partial output is delivered is the deliver step's decision.
 
 Between the agent and the terminal line it prints `STATUS: PACKAGING` and `OUTPUT: documents=N bytes=N unresolved_sources=N`.
 Failures use the codes of the status vocabulary: `NO_SOURCE` (the source is gone or empty), `TOO_LARGE` (a size cap),
@@ -139,6 +139,23 @@ the agent never runs; a failure after it is `FAILED` whatever the agent claimed.
 `FAILED INTERNAL` and nothing of it is printed: a traceback can hold paths from the customer's source.
 
 The steps are plain functions (`pre_step`, `post_step`), so the same code can run in separate containers later.
+
+**Who runs it decides the privilege model.**
+
+- **Root (what the image is built for).** The supervisor extracts the source (root-owned, so read-only for the agent by
+  ownership, not by a rule it could change), keeps its own files in a root-only directory (`/run/docugen`, never under
+  `/workspace`, which the agent can write), and starts the agent as an unprivileged user with no supplementary groups.
+  That user cannot read the supervisor's environment (where the presigned URLs are) or its memory. The output directory
+  belongs to the agent, so **the supervisor never writes in it**: a root process that wrote the manifest there would
+  follow any link the agent had left in the way. It reads the tree (links, devices and hard links are refused before
+  anything is opened; files are opened without following links) and puts the manifest into the archive from memory.
+  The agent is never root: `DOCUGEN_AGENT_UID` and `DOCUGEN_AGENT_GID` (default 1001) must be from 1 to 65535, and
+  `DOCUGEN_AGENT_HOME` (default `/home/claude`) a plain absolute path. If the switch is refused (a platform without
+  `setuid`) the session ends with `docugen-box: cannot start the agent: permission denied (switching to the agent user?)`
+  and exit 2, which is how a deployment finds out.
+- **Not root (the fallback).** One user does everything. After the extraction the source is made read-only by mode bits and
+  the scratch files live in the work directory. The separation is then only as strong as the agent's own permission
+  rules and the deliver step, which re-hashes its own copy of the source.
 
 ## Tests
 
