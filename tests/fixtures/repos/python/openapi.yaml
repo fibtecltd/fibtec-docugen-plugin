@@ -1,0 +1,23 @@
+openapi: 3.0.3
+info:
+  title: Sessions API
+  version: "1.0"
+paths:
+  /v1/sessions:
+    post:
+      summary: Submit a repository for documentation
+      operationId: createSession
+      parameters:
+        - {name: tenant_id, in: query, required: true, schema: {type: integer}}
+        - {name: repo, in: query, required: true, schema: {type: string}}
+      responses:
+        "202": {description: Accepted}
+        "402": {description: No credit}
+  /v1/sessions/{session_id}:
+    get:
+      summary: Read a session's state
+      operationId: getSession
+      parameters:
+        - {name: session_id, in: path, required: true, schema: {type: integer}}
+      responses:
+        "200": {description: The session}

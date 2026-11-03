@@ -10,17 +10,16 @@ from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2] / "plugins" / "docugen-box"  # the plugin; the repository root is not one
 SKILLS = sorted((ROOT / "skills").glob("*/SKILL.md"))
 
-# The commands the box allows (claude-config-closed/settings.json in claude-docker-ecs). A skill may tell the
-# model to run these and nothing else.
+# The commands the box allows (its permission settings). A skill may tell the model to run these and nothing else.
 ALLOWED_COMMANDS = {"docugen-src", "docugen-verify", "mmdc", "plantuml"}
 DOCUGEN_SRC_SUBCOMMANDS = {"tree", "find", "grep", "manifest"}
 DOCUGEN_VERIFY_SUBCOMMANDS = {"markdown", "svg", "diagram", "secrets"}  # model-facing subset of docugen.verify
 
 # What the box wrapper will accept as the only output of a session. Changing either list changes the contract
-# with the wrapper in claude-docker-ecs: update both together.
+# with the box wrapper: update both together.
 STATUS_WORDS = ["STARTED", "INDEXED", "DRAFTING", "VALIDATING", "REPAIRING", "PACKAGING", "DONE", "FAILED",
                 "INJECTION_SUSPECTED", "LIMIT_REACHED"]
 FAILURE_CODES = ["NO_SOURCE", "TOO_LARGE", "VALIDATION", "BUDGET", "DENIED", "INTERNAL"]
@@ -39,7 +38,7 @@ def frontmatter(path: Path) -> dict[str, str]:
 
 def test_manifest_is_valid() -> None:
     m = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text())
-    assert m["name"] == "fibtec-docugen-plugin"  # plugins-closed.lock requires the lock name to equal this
+    assert m["name"] == "docugen-box"  # the image's plugin lock requires its name to equal this
     assert re.fullmatch(r"\d+\.\d+\.\d+", m["version"])
     assert m["description"] and m["author"]["name"]
 
@@ -61,8 +60,7 @@ def test_the_plugin_carries_no_hooks_mcp_servers_agents_or_commands() -> None:
     """Plugin hooks run commands and MCP servers start processes; in the box neither is wanted, and a
     plugin that quietly grew one would be loaded with the session's credentials in its environment."""
     top = {p.name for p in ROOT.iterdir() if p.name not in NOT_PLUGIN_CONTENT}
-    assert top <= {".claude-plugin", ".github", ".gitignore", "skills", "scripts", "tests", "README.md",
-                   "pyproject.toml", "pytest.ini"}, top
+    assert top <= {".claude-plugin", "skills", "scripts"}, top
     names = {p.name for p in plugin_files()}
     assert "hooks.json" not in names and ".mcp.json" not in names
     assert {p.name for p in (ROOT / ".claude-plugin").iterdir()} == {"plugin.json"}
@@ -110,7 +108,11 @@ def test_skills_only_tell_the_model_to_run_allowed_commands(path: Path) -> None:
 
 
 def test_every_docugen_src_subcommand_the_script_offers_is_documented_in_the_session_skill() -> None:
-    from scripts import docugen_src  # noqa: PLC0415 - the script is the source of truth for its commands
+    import importlib.util  # noqa: PLC0415 - the script is the source of truth for its commands
+    spec = importlib.util.spec_from_file_location("docugen_src", ROOT / "scripts" / "docugen_src.py")
+    assert spec and spec.loader
+    docugen_src = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(docugen_src)
     offered = {a.dest for a in docugen_src.build_parser()._subparsers._group_actions[0]._choices_actions}  # type: ignore[union-attr]
     assert offered == DOCUGEN_SRC_SUBCOMMANDS
     documented = {line.split()[1] for line in command_lines(ROOT / "skills" / "docugen-session" / "SKILL.md")
