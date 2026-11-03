@@ -13,7 +13,7 @@ commit, with no credentials.
 |---|---|
 | `plugins/docugen-box/` | the Claude Code plugin the agent runs under inside the DocuGen box (a sealed container, one per documentation session; source read-only, no internet route): the session contract, the verify skill and `docugen-src` |
 | `docugen/verify/` | the validators, standard library only: they decide what may enter DocuGen (uploaded archives, secrets) and what may leave it (Markdown, SVG, diagram sources, the output tree and its provenance manifest). The same code runs in the box, in the delivery step and in CI |
-| `docugen/box/` | what runs around the agent in the box: the status vocabulary and the supervisor that lets nothing but status lines out of a session |
+| `docugen/box/` | what runs around the agent in the box: the status vocabulary, the supervisor that lets nothing but status lines out of a session, the transfer of source in and output out, and the provenance manifest |
 | `tests/` | the tests of all three, with hostile inputs built in code rather than committed |
 
 ### The plugin: `plugins/docugen-box`
@@ -93,6 +93,29 @@ is still a claim about the documents, not a proof: the deliver step re-checks ev
 them for the model and a test requires the two to agree. `tests/fixtures/claude-stream/` holds real event
 streams from Claude Code 2.1.294 (see the README there); the supervisor is tested against them and against
 hostile streams built in code.
+
+### Source in, output out: `transfer` and `provenance`
+
+Two more pieces of trusted code that run in the box before and after the agent, never during it. They are libraries so
+far: the session flow that calls them, and the box entrypoint, come next.
+
+`docugen.box.transfer` is the box's side of the presigned S3 URLs the orchestrator puts in the box's environment file
+(a GET for the source, a POST for the output). A presigned URL is a bearer secret, so a URL is accepted only if it is
+`https` to an `*.amazonaws.com` name (or plain `http` to a loopback address, which is how the tests and the image's smoke
+test serve one); redirects are never followed and the environment's proxies are ignored; a download stops at its byte
+cap however long the server keeps sending; a file that is already at the destination is never touched; and no error
+message, and nothing that is returned, contains a URL or a form field value (the exception chain that would print one is
+cut). The fields of a presigned POST come from the environment as a JSON object of text to text; the file is sent last, as
+S3 requires.
+
+`docugen.box.provenance` builds `docs/.docugen/manifest.json`, which nothing built before (the session skill tells the
+model to leave it alone). Source hashes come from the source tree, which is root-owned and read-only for the agent; document
+hashes come from what the agent wrote, after it has stopped; the source (a commit, or the SHA-256 of an uploaded archive)
+and the tools come from the caller. The one thing the agent says is which files a document was derived from, in its
+`## Sources` section; a path that is not a regular file inside the source tree (missing, a directory, a symbolic link, a
+`..` or absolute path) is not recorded and is returned to the caller, so a manifest never claims a provenance the source
+does not have. A diagram and its rendering take the sources of the Markdown documents that embed them. The result passes
+`docugen.verify.manifest.check_manifest` against the real trees, which is how the tests check it.
 
 ## Tests
 
