@@ -1,0 +1,444 @@
+"""A whole session in the box: fetch the source, run the agent, check, document and upload the output."""
+
+from __future__ import annotations
+
+import io
+import json
+import os
+import subprocess
+import sys
+import tarfile
+import zipfile
+from collections.abc import Callable
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from docugen.box import session, transfer
+from docugen.box.session import ConfigError, OutputSummary, SessionConfig, StepFailed, load_tools
+from docugen.verify.archive_safe import Limits as RealLimits
+from docugen.verify.manifest import MANIFEST_PATH, check_manifest, check_tree
+from tests.box.test_supervise import FAKE, ROOT, event_assistant, event_result, stream_file, supervisor_env
+from tests.box.test_transfer import parse_multipart, reply, serve
+
+SESSION_ID = "0b6f3a52-5c0e-4a52-9f0e-2a1d9c7c1111"
+COMMIT = "0123456789abcdef0123456789abcdef01234567"
+NOW = datetime(2026, 11, 3, 12, 0, 0, tzinfo=timezone.utc)
+SECRET = "SECRETSIGNATURE0123456789"
+SOURCE_FILES = {"app/api.py": "def handler():\n    return 1\n", "app/models.py": "class Session: ...\n", "README.md": "# repo\n"}
+INDEX = "# Overview\n\nSee ![classes](diagrams/class.svg).\n\n## Sources\napp/api.py\napp/models.py:1\n"
+DOCS = {"docs/index.md": INDEX, "docs/diagrams/class.mmd": "classDiagram\n  class Session\n",
+        "docs/diagrams/class.svg": "<svg xmlns='http://www.w3.org/2000/svg'/>"}
+
+
+def tar_bytes(files: dict[str, str]) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for rel, text in sorted(files.items()):
+            data = text.encode()
+            info = tarfile.TarInfo(rel)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+class Backend:
+    """Serves the source and records what is uploaded."""
+
+    def __init__(self, source: bytes, source_status: int = 200, upload_status: int = 204) -> None:
+        self.source, self.source_status, self.upload_status = source, source_status, upload_status
+        self.uploads: list[tuple[dict[str, str], bytes]] = []
+        self.gets = 0
+
+    def __call__(self, handler: BaseHTTPRequestHandler, body: bytes) -> None:
+        if handler.command == "GET":
+            self.gets += 1
+            return reply(handler, self.source_status, self.source if self.source_status == 200 else b"<Error/>")
+        if self.upload_status == 204:
+            parts = parse_multipart(handler.headers["Content-Type"], body)
+            self.uploads.append(({k: v.decode() for k, v in parts[:-1]}, parts[-1][1]))
+        return reply(handler, self.upload_status)
+
+
+class World:
+    def __init__(self, tmp: Path, backend: Backend, base: str) -> None:
+        self.src, self.out, self.work = tmp / "src", tmp / "out", tmp / "work"
+        for d in (self.src, self.out):
+            d.mkdir()
+        self.work.mkdir(mode=0o700)
+        self.tmp, self.backend, self.base = tmp, backend, base
+        self.record = tmp / "agent.json"
+        self.environ: dict[str, str] = {
+            "PATH": os.environ["PATH"], "ANTHROPIC_API_KEY": "sk-not-real", "FAKE_OUT_DIR": str(self.out),
+            "FAKE_RECORD": str(self.record), "FAKE_WRITE": json.dumps(DOCS),
+            "DOCUGEN_SESSION_ID": SESSION_ID, "DOCUGEN_SOURCE_URL": f"{base}/source?sig={SECRET}",
+            "DOCUGEN_OUT_URL": f"{base}/upload", "DOCUGEN_OUT_FIELDS": json.dumps({"key": f"out/t/{SESSION_ID}/docs.tar", "policy": SECRET}),
+            "DOCUGEN_SOURCE_KIND": "github", "DOCUGEN_SOURCE_COMMIT": COMMIT,
+        }
+
+    def stream(self, events: list[Any], agent_exit: int = 0) -> None:
+        self.environ["FAKE_STREAM"] = str(stream_file(self.tmp, events))
+        self.environ["FAKE_EXIT"] = str(agent_exit)
+
+    def run(self, *, argv: list[str] | None = None, tools: str | None = None) -> tuple[int, list[str]]:
+        out = io.StringIO()
+        argv = argv if argv is not None else [sys.executable, str(FAKE), "-p", "go"]
+        rc = session.run_session(argv, self.environ, src_dir=str(self.src), out_dir=str(self.out), work_dir=str(self.work),
+                                 tools_file=tools or str(self.tmp / "no-tools.json"), out=out, now=NOW)
+        return rc, out.getvalue().splitlines()
+
+
+@pytest.fixture
+def world(tmp_path: Path):
+    """A World against a backend that serves a good source; ``make(backend)`` swaps in another."""
+    contexts: list[Any] = []
+
+    def make(backend: Backend | None = None) -> World:
+        backend = backend or Backend(tar_bytes(SOURCE_FILES))
+        context = serve(backend)
+        base, _hits = context.__enter__()
+        contexts.append(context)
+        w = World(tmp_path, backend, base)
+        w.stream([event_assistant("STATUS: DRAFTING"), event_result("STATUS: DONE")])
+        return w
+
+    yield make
+    for context in contexts:
+        context.__exit__(None, None, None)
+
+
+def status_lines(lines: list[str]) -> list[str]:
+    return [ln for ln in lines if ln.startswith("STATUS: ")]
+
+
+# ── a good session ──────────────────────────────────────────────────────────────────────────────────
+
+def test_a_good_session_fetches_runs_packs_and_uploads(world) -> None:
+    w = world()
+    rc, lines = w.run()
+    assert rc == 0
+    assert lines[0] == "STATUS: DRAFTING" and lines[1] == "STATUS: PACKAGING"
+    assert lines[2].startswith("OUTPUT: documents=3 bytes=") and lines[2].endswith(" unresolved_sources=0")
+    assert lines[3].startswith("USAGE: ") and lines[-1] == "STATUS: DONE" and len(lines) == 5
+
+    # the source was extracted where the agent could read it, and the work directory is clean again
+    assert (w.src / "app" / "api.py").read_text() == SOURCE_FILES["app/api.py"]
+    assert list(w.work.iterdir()) == []
+
+    # exactly one upload, with the fields first and the file last
+    (fields, payload), = w.backend.uploads
+    assert list(fields) == ["key", "policy"] and fields["key"].endswith("/docs.tar")
+    assert w.backend.gets == 1
+    assert lines[2].split("bytes=")[1].split(" ")[0] == str(len(payload))
+
+    with tarfile.open(fileobj=io.BytesIO(payload)) as tar:
+        names = tar.getnames()
+        assert names == sorted(names) == ["docs/.docugen/manifest.json", "docs/diagrams/class.mmd", "docs/diagrams/class.svg", "docs/index.md"]
+        for member in tar.getmembers():   # reproducible: nothing about who or when
+            assert (member.mtime, member.uid, member.gid, member.uname, member.gname, member.mode) == (0, 0, 0, "", "", 0o644)
+            assert member.isreg()
+        manifest = json.loads(tar.extractfile("docs/.docugen/manifest.json").read())  # type: ignore[union-attr]
+    assert manifest["source"] == {"kind": "github", "commit": COMMIT} and manifest["generated_at"] == "2026-11-03T12:00:00Z"
+    index = next(d for d in manifest["documents"] if d["path"] == "docs/index.md")
+    assert [s["path"] for s in index["sources"]] == ["app/api.py", "app/models.py"]
+
+    # what was uploaded is what the validators accept, against the source the box extracted
+    assert check_tree(str(w.out)) == []
+    assert check_manifest(json.loads((w.out / MANIFEST_PATH).read_text()), root=str(w.out), source_root=str(w.src)) == []
+
+
+def test_the_agent_never_sees_the_session_secrets(world) -> None:
+    w = world()
+    w.run()
+    names = json.loads(w.record.read_text())["env"]
+    assert not [n for n in names if n.startswith("DOCUGEN_")]
+    assert "ANTHROPIC_API_KEY" in names and "PATH" in names and "PYTHONPATH" not in names
+    assert w.record.read_text().count(SECRET) == 0
+
+
+def test_the_manifest_records_the_tools_of_the_image(world, tmp_path: Path) -> None:
+    w = world()
+    tools = tmp_path / "tools.json"
+    tools.write_text(json.dumps({"mermaid-cli": "12.2.0", "plantuml": "1.2026.9", "bad": 3, "": "x"}))
+    w.run(tools=str(tools))
+    (_, payload), = w.backend.uploads
+    with tarfile.open(fileobj=io.BytesIO(payload)) as tar:
+        manifest = json.loads(tar.extractfile("docs/.docugen/manifest.json").read())  # type: ignore[union-attr]
+    assert manifest["generator"]["tools"] == {"mermaid-cli": "12.2.0", "plantuml": "1.2026.9"}
+
+
+def test_unresolved_citations_are_counted_and_do_not_fail_the_session(world) -> None:
+    w = world()
+    w.environ["FAKE_WRITE"] = json.dumps({**DOCS, "docs/more.md": "# More\n\n## Sources\napp/missing.py\napp/api.py\n../etc/passwd\n"})
+    rc, lines = w.run()
+    assert rc == 0 and lines[-1] == "STATUS: DONE"
+    assert next(ln for ln in lines if ln.startswith("OUTPUT:")).endswith("unresolved_sources=2")
+
+
+def test_a_zip_source_is_accepted_too(world) -> None:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for rel, text in SOURCE_FILES.items():
+            zf.writestr(rel, text)
+    w = world(Backend(buf.getvalue()))
+    rc, lines = w.run()
+    assert rc == 0 and lines[-1] == "STATUS: DONE" and (w.src / "README.md").exists()
+
+
+# ── how the agent ended ─────────────────────────────────────────────────────────────────────────────
+
+def test_a_session_that_hit_its_limit_still_packs_what_it_has(world) -> None:
+    w = world()
+    w.stream([event_assistant("STATUS: DRAFTING"), event_result("", is_error=True, subtype="error_max_turns", terminal_reason="max_turns")], 1)
+    rc, lines = w.run()
+    assert rc == 3 and lines[-1] == "STATUS: LIMIT_REACHED"
+    assert any(ln.startswith("OUTPUT: ") for ln in lines) and len(w.backend.uploads) == 1
+
+
+@pytest.mark.parametrize("events,agent_exit,expected", [
+    ([event_assistant("STATUS: INDEXED"), event_result("I could not find it.\nSTATUS: FAILED NO_SOURCE")], 0, "STATUS: FAILED NO_SOURCE"),
+    ([event_assistant("STATUS: DONE")], 0, "STATUS: FAILED INTERNAL"),                                    # no result: a crash
+    ([event_result("STATUS: DONE", is_error=True, terminal_reason="api_error", api_error_status=429)], 1, "STATUS: FAILED BUDGET"),
+])
+def test_a_session_that_did_not_end_well_uploads_nothing(world, events: list, agent_exit: int, expected: str) -> None:
+    w = world()
+    w.stream(events, agent_exit)
+    rc, lines = w.run()
+    assert rc == 1 and lines[-1] == expected
+    assert w.backend.uploads == [] and "STATUS: PACKAGING" not in lines
+    assert not (w.out / MANIFEST_PATH).exists()
+
+
+# ── the pre-step ────────────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("status,expected", [(404, "NO_SOURCE"), (403, "NO_SOURCE"), (500, "INTERNAL"), (400, "INTERNAL")])
+def test_a_source_that_cannot_be_fetched_never_starts_the_agent(world, status: int, expected: str) -> None:
+    w = world(Backend(b"", source_status=status))
+    rc, lines = w.run()
+    assert rc == 1 and lines == [f"STATUS: FAILED {expected}"]
+    assert not w.record.exists() and w.backend.uploads == []
+
+
+def test_a_source_nobody_serves(world) -> None:
+    w = world()
+    w.environ["DOCUGEN_SOURCE_URL"] = "http://127.0.0.1:9/source"
+    rc, lines = w.run()
+    assert (rc, lines) == (1, ["STATUS: FAILED INTERNAL"]) and not w.record.exists()
+
+
+def test_a_source_over_the_cap_is_too_large(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    w = world()
+    monkeypatch.setattr(session, "MAX_SOURCE_BYTES", 100)
+    rc, lines = w.run()
+    assert (rc, lines) == (1, ["STATUS: FAILED TOO_LARGE"]) and not w.record.exists()
+
+
+@pytest.mark.parametrize("archive,expected", [
+    (tar_bytes({"../escape.txt": "x"}), "INTERNAL"),          # a path that leaves the directory
+    (tar_bytes({"/etc/passwd": "x"}), "INTERNAL"),
+    (tar_bytes({}), "INTERNAL"),                               # a tar with no members is not a recognisable archive
+    (b"this is not an archive at all", "INTERNAL"),
+])
+def test_a_source_that_is_not_acceptable_never_starts_the_agent(world, archive: bytes, expected: str) -> None:
+    w = world(Backend(archive))
+    rc, lines = w.run()
+    assert (rc, lines) == (1, [f"STATUS: FAILED {expected}"])
+    assert not w.record.exists() and w.backend.uploads == []
+    assert not (w.work / "source.tar").exists()
+    assert not (w.tmp / "escape.txt").exists()
+
+
+def test_an_archive_with_no_files_in_it_has_nothing_to_document(world) -> None:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        info = tarfile.TarInfo("app")
+        info.type = tarfile.DIRTYPE
+        tar.addfile(info)
+    w = world(Backend(buf.getvalue()))
+    rc, lines = w.run()
+    assert (rc, lines) == (1, ["STATUS: FAILED NO_SOURCE"]) and not w.record.exists()
+
+
+def test_a_source_with_only_skipped_files_has_nothing_to_document(world) -> None:
+    w = world(Backend(tar_bytes({".env": "TOKEN=x\n", "node_modules/x/index.js": "x\n", "id_rsa": "key\n"})))
+    rc, lines = w.run()
+    assert (rc, lines) == (1, ["STATUS: FAILED NO_SOURCE"]) and not w.record.exists()
+
+
+def test_extraction_limits_are_the_ingest_limits(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    w = world(Backend(tar_bytes({f"f{i}.py": "x\n" for i in range(5)})))
+    monkeypatch.setattr(session, "Limits", lambda: RealLimits(max_files=3))
+    rc, lines = w.run()
+    assert (rc, lines) == (1, ["STATUS: FAILED TOO_LARGE"])
+
+
+# ── the post-step ───────────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("write,symlinks,why", [
+    ({"notes.md": "# outside docs\n"}, {}, "a file outside docs/"),
+    ({"docs/run.sh": "#!/bin/sh\n"}, {}, "an extension that is not delivered"),
+    ({"docs/.docugen/other.json": "{}"}, {}, "a hidden directory"),
+    ({"docs/Ünïcode.md": "# x\n"}, {}, "characters outside the allowed set"),
+    ({}, {"docs/link.md": "/etc/passwd"}, "a symbolic link"),
+    ({"docs/a.md": "# a\n", "docs/A.md": "# A\n"}, {}, "paths that differ only by case"),
+    ({"docs/empty.txt": "x"}, {}, "no document at all"),
+])
+def test_output_that_is_not_an_acceptable_tree_is_not_uploaded(world, write: dict, symlinks: dict, why: str) -> None:
+    w = world()
+    w.environ["FAKE_WRITE"] = json.dumps(write)
+    w.environ["FAKE_SYMLINKS"] = json.dumps(symlinks)
+    rc, lines = w.run()
+    assert rc == 1 and lines[-1] == "STATUS: FAILED VALIDATION", why
+    assert "STATUS: PACKAGING" in lines and w.backend.uploads == []
+    assert list(w.work.iterdir()) == []
+
+
+def test_a_session_that_wrote_nothing_has_nothing_to_deliver(world) -> None:
+    w = world()
+    w.environ["FAKE_WRITE"] = "{}"
+    rc, lines = w.run()
+    assert rc == 1 and lines[-1] == "STATUS: FAILED VALIDATION" and w.backend.uploads == []
+
+
+def test_output_over_the_cap_is_too_large_and_is_not_uploaded(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    w = world()
+    monkeypatch.setattr(session, "MAX_OUTPUT_BYTES", 2000)
+    rc, lines = w.run()
+    assert rc == 1 and lines[-1] == "STATUS: FAILED TOO_LARGE" and w.backend.uploads == []
+    assert list(w.work.iterdir()) == []
+
+
+@pytest.mark.parametrize("status", [403, 412, 500, 302])
+def test_an_upload_that_is_refused_fails_the_session(world, status: int) -> None:
+    w = world(Backend(tar_bytes(SOURCE_FILES), upload_status=status))
+    rc, lines = w.run()
+    assert rc == 1 and lines[-1] == "STATUS: FAILED INTERNAL"
+    assert list(w.work.iterdir()) == []   # the archive is removed even when the upload failed
+
+
+def test_a_manifest_that_does_not_match_the_trees_is_never_uploaded(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The builder is trusted, and its output is checked anyway, against the documents and the source on disk."""
+    real = session.build_manifest
+
+    def wrong(*args: Any, **kwargs: Any) -> Any:
+        manifest, unresolved = real(*args, **kwargs)
+        manifest["documents"][0]["sha256"] = "0" * 64
+        return manifest, unresolved
+
+    w = world()
+    monkeypatch.setattr(session, "build_manifest", wrong)
+    rc, lines = w.run()
+    assert rc == 1 and lines[-1] == "STATUS: FAILED INTERNAL" and w.backend.uploads == []
+    assert list(w.work.iterdir()) == []
+
+
+def test_an_agent_that_leaves_a_forged_manifest_gets_it_replaced(world) -> None:
+    w = world()
+    w.environ["FAKE_WRITE"] = json.dumps({**DOCS, MANIFEST_PATH: '{"schema": 1, "forged": true}'})
+    rc, _ = w.run()
+    assert rc == 0
+    (_, payload), = w.backend.uploads
+    with tarfile.open(fileobj=io.BytesIO(payload)) as tar:
+        assert b"forged" not in tar.extractfile(MANIFEST_PATH).read()  # type: ignore[union-attr]
+
+
+# ── started wrongly ─────────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("change", [
+    {"DOCUGEN_SESSION_ID": ""}, {"DOCUGEN_SESSION_ID": "not-a-uuid"}, {"DOCUGEN_SESSION_ID": SESSION_ID.upper()},
+    {"DOCUGEN_SOURCE_URL": ""}, {"DOCUGEN_SOURCE_URL": "https://example.com/x"}, {"DOCUGEN_OUT_URL": "http://example.com/x"},
+    {"DOCUGEN_OUT_FIELDS": "not json"}, {"DOCUGEN_OUT_FIELDS": "{}"},
+    {"DOCUGEN_SOURCE_KIND": ""}, {"DOCUGEN_SOURCE_KIND": "svn"}, {"DOCUGEN_SOURCE_COMMIT": "abc"},
+])
+def test_a_session_started_wrongly_does_nothing_and_says_so_without_a_value(world, capsys: pytest.CaptureFixture[str], change: dict) -> None:
+    w = world()
+    w.environ.update(change)
+    rc, lines = w.run()
+    assert rc == 2 and lines == []
+    err = capsys.readouterr().err
+    assert err.startswith("docugen-box: ") and err.count("\n") == 1
+    assert SECRET not in err and COMMIT not in err and "example.com" not in err
+    assert w.backend.gets == 0 and not w.record.exists()
+
+
+@pytest.mark.parametrize("argv", [[], [sys.executable, str(FAKE)], [sys.executable, str(FAKE), "--version"]])
+def test_a_session_without_a_prompt_fetches_nothing(world, capsys: pytest.CaptureFixture[str], argv: list[str]) -> None:
+    w = world()
+    rc, lines = w.run(argv=argv)
+    assert rc == 2 and lines == [] and w.backend.gets == 0
+    assert capsys.readouterr().err == "docugen-box: the agent must be started headless (-p PROMPT)\n"
+
+
+def test_an_agent_that_cannot_start_ends_the_session_wrongly_started(world, capsys: pytest.CaptureFixture[str]) -> None:
+    w = world()
+    rc, lines = w.run(argv=["/nonexistent/claude", "-p", "go"])
+    assert (rc, lines) == (2, []) and capsys.readouterr().err == "docugen-box: cannot start the agent\n"
+
+
+def test_the_session_id_is_a_uuid_and_the_config_keeps_nothing_else() -> None:
+    config = SessionConfig.from_environ({
+        "DOCUGEN_SESSION_ID": SESSION_ID, "DOCUGEN_SOURCE_URL": "https://b.s3.eu-west-1.amazonaws.com/s?sig=1",
+        "DOCUGEN_OUT_URL": "https://b.s3.eu-west-1.amazonaws.com/", "DOCUGEN_OUT_FIELDS": '{"key": "k"}',
+        "DOCUGEN_SOURCE_KIND": "zip", "DOCUGEN_SOURCE_ARCHIVE_SHA256": "ab" * 32})
+    assert config.session_id == SESSION_ID and config.out_fields == {"key": "k"} and config.source.kind == "zip"
+    with pytest.raises(ConfigError):
+        SessionConfig.from_environ({})
+
+
+# ── nothing unexpected is ever printed ──────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("where", ["fetch", "extract", "build_manifest", "package", "upload"])
+def test_an_unexpected_exception_is_a_failed_session_and_prints_nothing_of_itself(world, monkeypatch: pytest.MonkeyPatch,
+                                                                                  capsys: pytest.CaptureFixture[str], where: str) -> None:
+    w = world()
+    boom = RuntimeError(f"/workspace/src/secret-customer-file.py {SECRET}")
+
+    def explode(*_a: object, **_k: object) -> None:
+        raise boom
+
+    target = {"fetch": (transfer, "fetch"), "extract": (session, "safe_extract"), "build_manifest": (session, "build_manifest"),
+              "package": (session, "package"), "upload": (transfer, "upload")}[where]
+    monkeypatch.setattr(*target, explode)
+    rc, lines = w.run()
+    assert rc == 1 and lines[-1] == "STATUS: FAILED INTERNAL"
+    captured = capsys.readouterr()
+    assert captured.err == "" and SECRET not in "".join(lines) and "secret-customer-file" not in "".join(lines)
+
+
+def test_the_command_line_entry_point(world, tmp_path: Path) -> None:
+    w = world()
+    env = {**supervisor_env(w.environ), "DOCUGEN_SRC_DIR": str(w.src), "DOCUGEN_OUT_DIR": str(w.out),
+           "DOCUGEN_WORK_DIR": str(w.work), "DOCUGEN_TOOLS_FILE": str(tmp_path / "none.json")}
+    done = subprocess.run([sys.executable, "-P", "-m", "docugen.box", "--session", "--", sys.executable, str(FAKE), "-p", "go"],
+                          env=env, capture_output=True, text=True, cwd=ROOT, timeout=120)
+    lines = done.stdout.splitlines()
+    assert done.returncode == 0 and done.stderr == ""
+    assert lines[-1] == "STATUS: DONE" and "STATUS: PACKAGING" in lines and len(w.backend.uploads) == 1
+
+
+def test_the_command_line_entry_point_never_prints_a_traceback(world, tmp_path: Path) -> None:
+    w = world()
+    env = {**supervisor_env(w.environ), "DOCUGEN_SRC_DIR": "/nonexistent/src", "DOCUGEN_OUT_DIR": str(w.out),
+           "DOCUGEN_WORK_DIR": "/nonexistent/work"}
+    done = subprocess.run([sys.executable, "-P", "-m", "docugen.box", "--session", "--", sys.executable, str(FAKE), "-p", "go"],
+                          env=env, capture_output=True, text=True, cwd=ROOT, timeout=120)
+    assert done.stdout == "STATUS: FAILED INTERNAL\n" and done.stderr == "" and done.returncode == 1
+
+
+def test_load_tools(tmp_path: Path) -> None:
+    path = tmp_path / "tools.json"
+    for content, expected in [('{"a": "1", "b": "2"}', {"a": "1", "b": "2"}), ('{"a": 1}', {}), ("[]", {}), ("not json", {}), ("", {}),
+                              (json.dumps({f"k{i}": "v" for i in range(51)}), {}), ('{"a": "' + "x" * 65 + '"}', {})]:
+        path.write_text(content)
+        assert load_tools(str(path)) == expected
+    assert load_tools(str(tmp_path / "missing.json")) == {}
+
+
+def test_the_output_line_is_numbers_only() -> None:
+    assert OutputSummary(3, 1024, 2).line() == "OUTPUT: documents=3 bytes=1024 unresolved_sources=2"
+    assert StepFailed("VALIDATION").code == "VALIDATION"
+    with pytest.raises(AssertionError):
+        StepFailed("SOMETHING_ELSE")

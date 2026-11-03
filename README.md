@@ -96,8 +96,8 @@ hostile streams built in code.
 
 ### Source in, output out: `transfer` and `provenance`
 
-Two more pieces of trusted code that run in the box before and after the agent, never during it. They are libraries so
-far: the session flow that calls them, and the box entrypoint, come next.
+Two more pieces of trusted code that run in the box before and after the agent, never during it. `session` (below) calls
+them.
 
 `docugen.box.transfer` is the box's side of the presigned S3 URLs the orchestrator puts in the box's environment file
 (a GET for the source, a POST for the output). A presigned URL is a bearer secret, so a URL is accepted only if it is
@@ -116,6 +116,29 @@ and the tools come from the caller. The one thing the agent says is which files 
 `..` or absolute path) is not recorded and is returned to the caller, so a manifest never claims a provenance the source
 does not have. A diagram and its rendering take the sources of the Markdown documents that embed them. The result passes
 `docugen.verify.manifest.check_manifest` against the real trees, which is how the tests check it.
+
+### A whole session: `docugen/box/session.py`
+
+`python3 -P -m docugen.box --session -- claude ARGS... -p PROMPT` runs one session from the orchestrator's environment
+(`DOCUGEN_SESSION_ID`, `DOCUGEN_SOURCE_URL`, `DOCUGEN_OUT_URL`, `DOCUGEN_OUT_FIELDS` as a JSON object, and
+`DOCUGEN_SOURCE_KIND` with `DOCUGEN_SOURCE_COMMIT` or `DOCUGEN_SOURCE_ARCHIVE_SHA256`):
+
+1. **Pre-step.** Fetch the source (`transfer`), extract it safely into the source directory (`archive_safe`, the limits
+   the ingest step applies), refuse a session with nothing to document.
+2. **The agent**, through the supervisor, with every `DOCUGEN_*` variable removed from its environment: it never holds a
+   presigned URL.
+3. **Post-step**, only if the session ended `DONE` or `LIMIT_REACHED`: check the output tree (`docs/**`, fixed extensions,
+   no links or executables, at least one document), write the provenance manifest and check it against the source, pack
+   `docs/` into one reproducible tar and upload it. A `LIMIT_REACHED` session still packs what it has; whether partial
+   output is delivered is the deliver step's decision.
+
+Between the agent and the terminal line it prints `STATUS: PACKAGING` and `OUTPUT: documents=N bytes=N unresolved_sources=N`.
+Failures use the codes of the status vocabulary: `NO_SOURCE` (the source is gone or empty), `TOO_LARGE` (a size cap),
+`VALIDATION` (the output is not an acceptable tree), `INTERNAL` (anything else). **A failure before the agent starts means
+the agent never runs; a failure after it is `FAILED` whatever the agent claimed.** Any unexpected exception is
+`FAILED INTERNAL` and nothing of it is printed: a traceback can hold paths from the customer's source.
+
+The steps are plain functions (`pre_step`, `post_step`), so the same code can run in separate containers later.
 
 ## Tests
 

@@ -8,6 +8,9 @@ FAKE_STDERR   text written to standard error
 FAKE_RECORD   file that receives a JSON record of argv, environment names, whether stdin is empty
 FAKE_SLEEP    seconds to sleep after the stream (a session that does not finish)
 FAKE_BACKGROUND  start a background process that keeps standard output open for this many seconds
+FAKE_OUT_DIR  where FAKE_WRITE and FAKE_SYMLINKS put their files (the real agent works in the output directory)
+FAKE_WRITE    JSON object of relative path to text: files the session writes
+FAKE_SYMLINKS JSON object of relative path to target: symbolic links the session leaves behind
 """
 
 import json
@@ -23,6 +26,16 @@ def main() -> int:
         with open(record, "w") as fh:
             json.dump({"argv": sys.argv[1:], "env": sorted(os.environ), "stdin": sys.stdin.read(),
                        "pgid_is_own": os.getpgrp() == os.getpid()}, fh)
+    root = os.environ.get("FAKE_OUT_DIR", "")
+    for rel, text in json.loads(os.environ.get("FAKE_WRITE", "{}")).items():
+        path = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(text)
+    for rel, target in json.loads(os.environ.get("FAKE_SYMLINKS", "{}")).items():
+        path = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.symlink(target, path)
     if os.environ.get("FAKE_STDERR"):
         sys.stderr.write(os.environ["FAKE_STDERR"])
         sys.stderr.flush()
