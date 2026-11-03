@@ -5,7 +5,7 @@
   "author": {
     "name": "Fibtec Limited"
   },
-  "license": "UNLICENSED",
+  "license": "Apache-2.0",
   "homepage": "https://github.com/fibtecltd/fibtec-docugen-plugin",
   "repository": "https://github.com/fibtecltd/fibtec-docugen-plugin",
   "keywords": [

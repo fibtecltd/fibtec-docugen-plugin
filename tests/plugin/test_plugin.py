@@ -43,6 +43,16 @@ def test_manifest_is_valid() -> None:
     assert m["description"] and m["author"]["name"]
 
 
+def test_the_licence_field_matches_the_licence_file() -> None:
+    m = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text())
+    assert m["license"] == "Apache-2.0"
+    assert (ROOT / "LICENSE").read_text(encoding="utf-8").lstrip().startswith("Apache License")
+
+
+def test_the_repository_and_the_plugin_carry_the_same_licence_text() -> None:
+    assert (ROOT.parents[1] / "LICENSE").read_bytes() == (ROOT / "LICENSE").read_bytes()
+
+
 # Directories that are development or VCS state, never plugin content: the CI job creates .venv inside the checkout.
 NOT_PLUGIN_CONTENT = {".git", ".venv", "__pycache__", ".pytest_cache"}
 
@@ -60,7 +70,7 @@ def test_the_plugin_carries_no_hooks_mcp_servers_agents_or_commands() -> None:
     """Plugin hooks run commands and MCP servers start processes; in the box neither is wanted, and a
     plugin that quietly grew one would be loaded with the session's credentials in its environment."""
     top = {p.name for p in ROOT.iterdir() if p.name not in NOT_PLUGIN_CONTENT}
-    assert top <= {".claude-plugin", "skills", "scripts"}, top
+    assert top <= {".claude-plugin", "skills", "scripts", "LICENSE"}, top
     names = {p.name for p in plugin_files()}
     assert "hooks.json" not in names and ".mcp.json" not in names
     assert {p.name for p in (ROOT / ".claude-plugin").iterdir()} == {"plugin.json"}

@@ -77,3 +77,7 @@ accept it unchanged, so a renderer upgrade that adds an attribute fails there an
 - `svg_sanitize` refuses `foreignObject`, so Mermaid must render labels without it (`htmlLabels: false`).
 - `diagram_check` has no grounding gate yet (identifiers cited by a diagram against the fact index).
 - Markdown checks are line-based and conservative: a tag outside the small allowlist is a finding even in prose.
+
+## Licence
+
+Apache-2.0. See [LICENSE](LICENSE).
