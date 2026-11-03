@@ -10,8 +10,8 @@ from pathlib import Path
 import pytest
 
 from docugen.box import provenance
-from docugen.box.provenance import SourceInfo, build_manifest, cited_paths, write_manifest
-from docugen.verify.manifest import MANIFEST_PATH, check_manifest, check_tree, load_manifest
+from docugen.box.provenance import SourceInfo, build_manifest, cited_paths, manifest_bytes
+from docugen.verify.manifest import MANIFEST_PATH, check_manifest, check_tree
 
 NOW = datetime(2026, 11, 3, 12, 0, 0, tzinfo=timezone.utc)
 COMMIT = "0123456789abcdef0123456789abcdef01234567"
@@ -55,10 +55,10 @@ def build(src: Path, out: Path, **kw) -> tuple[dict, list[tuple[str, str]]]:
 def test_the_manifest_passes_the_validator_that_checks_it(trees: tuple[Path, Path]) -> None:
     src, out = trees
     manifest, unresolved = build(src, out)
-    write_manifest(str(out), manifest)
     assert unresolved == []
     assert check_tree(str(out)) == []
-    assert check_manifest(load_manifest(str(out)), root=str(out), source_root=str(src)) == []
+    assert check_manifest(manifest, root=str(out), source_root=str(src)) == []
+    assert check_manifest(json.loads(manifest_bytes(manifest)), root=str(out), source_root=str(src)) == []
 
 
 def test_every_document_is_listed_with_its_kind_hash_and_sources(trees: tuple[Path, Path]) -> None:
@@ -142,8 +142,7 @@ def test_citations_that_are_not_regular_files_in_the_source_are_not_recorded(tre
     doc = next(d for d in manifest["documents"] if d["path"] == "docs/cites.md")
     assert [s["path"] for s in doc["sources"]] == ["app/api.py"]
     assert [c for d, c in unresolved if d == "docs/cites.md"] == [b for b in bad if b]   # every one, in order
-    write_manifest(str(out), manifest)
-    assert check_manifest(load_manifest(str(out)), root=str(out), source_root=str(src)) == []
+    assert check_manifest(manifest, root=str(out), source_root=str(src)) == []
 
 
 def test_a_document_without_sources_is_listed_with_none(trees: tuple[Path, Path]) -> None:
@@ -165,17 +164,15 @@ def test_files_that_are_not_documents_are_left_out(trees: tuple[Path, Path]) -> 
 def test_a_tampered_document_no_longer_matches_its_manifest(trees: tuple[Path, Path]) -> None:
     src, out = trees
     manifest, _ = build(src, out)
-    write_manifest(str(out), manifest)
-    (out / "docs" / "api.md").write_text("# API\n\nchanged after the manifest was written\n")
-    assert {f.rule for f in check_manifest(load_manifest(str(out)), root=str(out), source_root=str(src))} == {"manifest-document-hash"}
+    (out / "docs" / "api.md").write_text("# API\n\nchanged after the manifest was built\n")
+    assert {f.rule for f in check_manifest(manifest, root=str(out), source_root=str(src))} == {"manifest-document-hash"}
 
 
 def test_a_changed_source_no_longer_matches_its_manifest(trees: tuple[Path, Path]) -> None:
     src, out = trees
     manifest, _ = build(src, out)
-    write_manifest(str(out), manifest)
     (src / "app" / "api.py").write_text("def handler():\n    return 2\n")
-    assert "manifest-source-hash" in {f.rule for f in check_manifest(load_manifest(str(out)), root=str(out), source_root=str(src))}
+    assert "manifest-source-hash" in {f.rule for f in check_manifest(manifest, root=str(out), source_root=str(src))}
 
 
 # ── reading the Sources section ─────────────────────────────────────────────────────────────────────
@@ -231,34 +228,25 @@ def test_the_source_from_the_environment() -> None:
             SourceInfo.from_environ(env)
 
 
-# ── writing it ──────────────────────────────────────────────────────────────────────────────────────
+# ── serialising it ──────────────────────────────────────────────────────────────────────────────────
 
-def test_writing_replaces_a_manifest_the_agent_left(trees: tuple[Path, Path]) -> None:
+def test_the_manifest_is_canonical_json_and_nothing_is_written(trees: tuple[Path, Path]) -> None:
+    src, out = trees
+    before = sorted(str(p) for p in out.rglob("*"))
+    manifest, _ = build(src, out)
+    data = manifest_bytes(manifest)
+    assert data.endswith(b"}\n") and not data.endswith(b"\n\n") and json.loads(data) == manifest
+    assert data == manifest_bytes(json.loads(data))                                   # canonical: a round trip changes nothing
+    assert list(json.loads(data)) == sorted(json.loads(data))                          # keys sorted
+    assert sorted(str(p) for p in out.rglob("*")) == before                            # not a byte written in the agent's tree
+
+
+def test_a_manifest_the_agent_left_is_ignored_by_the_builder(trees: tuple[Path, Path]) -> None:
     src, out = trees
     put(out, {MANIFEST_PATH: '{"schema": 1, "forged": true}'})
     manifest, _ = build(src, out)
-    path = write_manifest(str(out), manifest)
-    assert path == str(out / MANIFEST_PATH) and "forged" not in Path(path).read_text()
-    assert not Path(path + ".tmp").exists()
-    assert check_manifest(load_manifest(str(out)), root=str(out), source_root=str(src)) == []
-
-
-def test_writing_refuses_a_symbolic_link_in_the_way(trees: tuple[Path, Path], tmp_path: Path) -> None:
-    src, out = trees
-    elsewhere = tmp_path / "elsewhere"
-    elsewhere.mkdir()
-    (out / "docs" / ".docugen").symlink_to(elsewhere)
-    manifest, _ = build(src, out)
-    with pytest.raises(ValueError):
-        write_manifest(str(out), manifest)
-    assert list(elsewhere.iterdir()) == []
-
-    (out / "docs" / ".docugen").unlink()
-    (out / "docs" / ".docugen").mkdir()
-    (out / MANIFEST_PATH).symlink_to(elsewhere / "target.json")
-    with pytest.raises(ValueError):
-        write_manifest(str(out), manifest)
-    assert list(elsewhere.iterdir()) == []
+    assert MANIFEST_PATH not in {d["path"] for d in manifest["documents"]} and b"forged" not in manifest_bytes(manifest)
+    assert check_manifest(manifest, root=str(out), source_root=str(src)) == []
 
 
 def test_the_standard_library_and_the_validators_only() -> None:

@@ -135,8 +135,8 @@ def build_manifest(out_root: str, src_root: str, source: SourceInfo, *, generato
     """The manifest of the documents under ``out_root/docs``, and the citations that could not be recorded.
 
     The second value lists ``(document, cited path)`` for every cited path that is not a regular file in the source tree.
-    The manifest is not written and not checked here: ``write_manifest`` writes it, and ``docugen.verify.manifest``
-    checks it (the box does both before it packages anything).
+    The manifest is neither serialised nor checked here: ``manifest_bytes`` serialises it, and
+    ``docugen.verify.manifest.check_manifest`` checks it (the box does both before it packages anything).
     """
     files, _findings = list_tree(out_root)  # structural problems are check_tree's to report, not this function's
     documents: dict[str, dict[str, Any]] = {}
@@ -199,16 +199,11 @@ def build_manifest(out_root: str, src_root: str, source: SourceInfo, *, generato
     return manifest, unresolved
 
 
-def write_manifest(out_root: str, manifest: dict[str, Any]) -> str:
-    """Write ``docs/.docugen/manifest.json`` under ``out_root`` (replacing one the agent may have left) and return its path."""
-    target = os.path.join(out_root, MANIFEST_PATH)
-    directory = os.path.dirname(target)
-    if os.path.islink(directory) or os.path.islink(target):
-        raise ValueError("the manifest location is a symbolic link")
-    os.makedirs(directory, exist_ok=True)
-    tmp = target + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(manifest, fh, indent=1, sort_keys=True)
-        fh.write("\n")
-    os.replace(tmp, target)
-    return target
+def manifest_bytes(manifest: dict[str, Any]) -> bytes:
+    """The manifest as it goes into the output archive: canonical JSON (sorted keys, one trailing newline).
+
+    It is returned, not written. The box's trusted code may run as root, and the output directory belongs to the agent: a
+    root process that created a file there would follow any link the agent had left in the way. The manifest goes
+    straight into the archive from memory, and a manifest the agent left in the tree is never packed.
+    """
+    return (json.dumps(manifest, indent=1, sort_keys=True) + "\n").encode("utf-8")
