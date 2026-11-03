@@ -13,7 +13,8 @@ commit, with no credentials.
 |---|---|
 | `plugins/docugen-box/` | the Claude Code plugin the agent runs under inside the DocuGen box (a sealed container, one per documentation session; source read-only, no internet route): the session contract, the verify skill and `docugen-src` |
 | `docugen/verify/` | the validators, standard library only: they decide what may enter DocuGen (uploaded archives, secrets) and what may leave it (Markdown, SVG, diagram sources, the output tree and its provenance manifest). The same code runs in the box, in the delivery step and in CI |
-| `tests/` | the tests of both, with hostile inputs built in code rather than committed |
+| `docugen/box/` | what runs around the agent in the box: the status vocabulary and the supervisor that lets nothing but status lines out of a session |
+| `tests/` | the tests of all three, with hostile inputs built in code rather than committed |
 
 ### The plugin: `plugins/docugen-box`
 
@@ -58,6 +59,40 @@ python3 -P -m docugen.verify tree out/ --source src/   # output allowlist + mani
 
 `-P` (or `-I` once installed) keeps the working directory off `sys.path`, so a file named `json.py` in the directory
 being checked cannot shadow the standard library.
+
+### The supervisor: `docugen/box`
+
+The box image starts the agent as `python3 -P -m docugen.box -- claude ARGS... -p PROMPT`. The supervisor runs
+Claude Code with `--output-format stream-json --verbose` (appended last, so the caller cannot switch it off),
+reads the event stream and prints, on standard output, only:
+
+- `STATUS: <word>` for the progress words the agent reports (`STARTED`, `INDEXED`, `DRAFTING`, `VALIDATING`,
+  `REPAIRING`, `PACKAGING`, `INJECTION_SUSPECTED`), built from the vocabulary and never echoed from the agent's
+  text, repeated words once, at most 100 lines;
+- one `USAGE: turns=N cost_usd=X duration_ms=N` line of numbers;
+- one terminal line: `STATUS: DONE`, `STATUS: FAILED <code>` or `STATUS: LIMIT_REACHED`.
+
+Everything else (the model's prose, tool calls and results, the agent's standard error) is read and dropped, so no
+customer content reaches the container's logs. Only the agent's own `assistant` text is read for words: a source
+file that contains `STATUS: DONE` reaches the agent as a tool result and says nothing.
+
+The terminal line is not the agent's claim. It comes from Claude Code's final `result` event and exit code: an
+agent that prints `STATUS: DONE` and then runs out of turns or budget is `LIMIT_REACHED`; a gateway answer 429 is
+`FAILED BUDGET`; a missing result, a crash or a kill is `FAILED INTERNAL`. The agent's `DONE` or
+`FAILED <code>` counts only when the session ended cleanly and it is the last line of its final message. It
+is still a claim about the documents, not a proof: the deliver step re-checks every output.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | `STATUS: DONE` |
+| 1 | `STATUS: FAILED <code>` (`NO_SOURCE`, `TOO_LARGE`, `VALIDATION`, `BUDGET`, `DENIED`, `INTERNAL`) |
+| 2 | the box was started wrongly: no `-p`, or no agent to run |
+| 3 | `STATUS: LIMIT_REACHED`: a turn or spend limit; the output may be partial and the deliver step decides |
+
+`docugen/box/status.py` is the one definition of the words and codes; `skills/docugen-session/SKILL.md` lists
+them for the model and a test requires the two to agree. `tests/fixtures/claude-stream/` holds real event
+streams from Claude Code 2.1.294 (see the README there); the supervisor is tested against them and against
+hostile streams built in code.
 
 ## Tests
 
