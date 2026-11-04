@@ -11,7 +11,7 @@ commit, with no credentials.
 
 | Path | What it is |
 |---|---|
-| `plugins/docugen-box/` | the Claude Code plugin the agent runs under inside the DocuGen box (a sealed container, one per documentation session; source read-only, no internet route): the session contract, the verify skill and `docugen-src` |
+| `plugins/docugen-box/` | the Claude Code plugin the agent runs under inside the DocuGen box (a sealed container, one per documentation session; source read-only, no inbound connections, outbound HTTPS only): the session contract, the verify skill and `docugen-src` |
 | `docugen/verify/` | the validators, standard library only: they decide what may enter DocuGen (uploaded archives, secrets) and what may leave it (Markdown, SVG, diagram sources, the output tree and its provenance manifest). The same code runs in the box, in the delivery step and in CI |
 | `docugen/box/` | what runs around the agent in the box: the status vocabulary, the supervisor that lets nothing but status lines out of a session, the transfer of source in and output out, and the provenance manifest |
 | `tests/` | the tests of all three, with hostile inputs built in code rather than committed |
