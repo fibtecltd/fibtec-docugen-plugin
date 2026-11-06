@@ -50,7 +50,7 @@ docugen-src grep 'class \w+' --glob '*.py' -C 1
 | `svg_sanitize` | allowlist rebuild of rendered SVG: no scripts, `foreignObject`, remote references, event handlers, DOCTYPE or entities |
 | `diagram_check` | Mermaid and PlantUML source policy (no includes, URLs, environment access, `click`, security directives; supported types only) and a render check through the installed tool |
 | `manifest` | the shape of the output (`docs/**` only, fixed extensions, no symlinks or executable bits) and its provenance manifest (commit or archive hash, tools, document and source hashes). PDFs are accepted only when asked for (`allow_pdf`), directly under `docs/pdf/` |
-| `pdf_check` | a fail-closed scan of a PDF's bytes: no JavaScript, launch or submit actions, attachments, forms, media, encryption or object streams (names are decoded first, so `/J#61vaScript` is found), every stream's `/Length` exact with no `endstream` or `endobj` inside it, links only to http or https addresses, size and page caps |
+| `pdf_check` | a fail-closed scan of a PDF's bytes: no JavaScript, launch or submit actions, attachments, forms, media, encryption or object streams (names are decoded first, so `/J#61vaScript` is found), every stream's `/Length` exact with no `endstream` or `endobj` inside it, links only to http or https addresses, size and page caps, and a time that grows with the size of the file (a file built so that its links must be read again and again is refused as `pdf-complexity`) |
 
 ```bash
 python3 -P -m docugen.verify markdown docs/            # exit 0 clean, 1 findings, 2 usage; --json for machines

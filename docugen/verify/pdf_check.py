@@ -17,7 +17,10 @@ What it does:
   a scan like this one);
 - a ``/URI`` action must name an http or https address of at most ``MAX_URI_CHARS`` characters, with no spaces or control
   characters; internal links (``/Dest``) are fine;
-- at most ``MAX_PAGES`` pages.
+- at most ``MAX_PAGES`` pages;
+- the time it takes grows with the size of the file, not with its square: the strings are read for at most the size of the file
+  plus ``MAX_STRING_SLACK`` bytes in all (in a real file each is read once, so each byte is in at most one string); a file that
+  makes it read more (strings inside strings, a link started again and again) is refused as ``pdf-complexity``.
 
 A finding never holds the content of a file, only the name of the rule and, for a URI, its first characters.
 Standard library only.
@@ -33,6 +36,7 @@ MAX_BYTES = 10 * 1024 * 1024
 MAX_PAGES = 2000
 MAX_URI_CHARS = 2048
 MAX_FINDINGS = 20
+MAX_STRING_SLACK = 64 * 1024  # what the strings of a file may add up to, beyond the size of the file
 
 FORBIDDEN_NAMES = frozenset({
     "JavaScript", "JS", "OpenAction", "AA", "Launch", "SubmitForm", "ResetForm", "ImportData", "GoToR", "GoToE", "Rendition",
@@ -49,6 +53,9 @@ _END_OF_STREAM = re.compile(rb"(?:\r\n|\n|\r)?endstream")
 _PAGE = re.compile(rb"/Type[ \t\r\n]*/Page(?![A-Za-z0-9])")
 _URI_SCHEME = re.compile(r"https?://", re.IGNORECASE)
 _WHITESPACE = b" \t\r\n\f\x00"
+_STRING_SPECIAL = re.compile(rb"[\\()]")
+_OCTAL = re.compile(rb"[0-7]{1,3}")
+_ESCAPES = {b"n": b"\n", b"r": b"\r", b"t": b"\t", b"b": b"\b", b"f": b"\f"}
 
 
 def _decode_name(raw: bytes) -> str:
@@ -77,56 +84,64 @@ def _split(data: bytes) -> tuple[list[bytes], str | None]:
         pos = closing.end()
 
 
-def _string_after(chunk: bytes, pos: int) -> bytes | None:
-    """The PDF string (literal or hexadecimal) that starts at or after ``pos``, decoded, or None if a name or dictionary does."""
+def _string_after(chunk: bytes, pos: int) -> tuple[bytes | None, int]:
+    """The PDF string (literal or hexadecimal) that starts at or after ``pos``, decoded, and where reading it ended; or
+    ``(None, pos)`` if a name or dictionary starts there. A string that does not end is returned as an unterminated one, read to
+    the end of the chunk.
+
+    The cost is what is read, from ``pos`` to the returned end, which the caller adds up against a budget: a file in which strings
+    sit inside strings, each read again from its own start, would otherwise take time that grows with the square of its size."""
     while pos < len(chunk) and chunk[pos] in _WHITESPACE:
         pos += 1
     if pos >= len(chunk):
-        return None
+        return None, pos
+    limit = len(chunk)
     if chunk[pos:pos + 1] == b"(":
         out = bytearray()
         depth = 0
         i = pos
-        while i < len(chunk):
-            c = chunk[i:i + 1]
+        while i < limit:
+            special = _STRING_SPECIAL.search(chunk, i, limit)
+            if special is None:
+                break
+            at = special.start()
+            out += chunk[i:at]
+            c = chunk[at:at + 1]
             if c == b"\\":
-                nxt = chunk[i + 1:i + 2]
+                nxt = chunk[at + 1:at + 2]
                 if nxt and nxt in b"01234567":  # an octal escape: one to three digits
-                    digits = re.match(rb"[0-7]{1,3}", chunk[i + 1:]).group(0)  # type: ignore[union-attr]
+                    digits = _OCTAL.match(chunk, at + 1).group(0)  # type: ignore[union-attr]
                     out.append(int(digits, 8) & 0xFF)
-                    i += 1 + len(digits)
-                    continue
-                if nxt in (b"\r", b"\n"):  # a backslash before a line ending continues the line
-                    i += 3 if chunk[i + 1:i + 3] == b"\r\n" else 2
-                    continue
-                out += {b"n": b"\n", b"r": b"\r", b"t": b"\t", b"b": b"\b", b"f": b"\f"}.get(nxt, nxt)
-                i += 2
+                    i = at + 1 + len(digits)
+                elif nxt in (b"\r", b"\n"):  # a backslash before a line ending continues the line
+                    i = at + (3 if chunk[at + 1:at + 3] == b"\r\n" else 2)
+                else:
+                    out += _ESCAPES.get(nxt, nxt)
+                    i = at + 2
                 continue
             if c == b"(":
                 depth += 1
                 if depth > 1:
                     out += c
-            elif c == b")":
+            else:
                 depth -= 1
                 if depth == 0:
-                    return bytes(out)
+                    return bytes(out), at + 1
                 out += c
-            else:
-                out += c
-            i += 1
-        return b"\x00unterminated"
+            i = at + 1
+        return b"\x00unterminated", limit
     if chunk[pos:pos + 1] == b"<" and chunk[pos + 1:pos + 2] != b"<":
         close = chunk.find(b">", pos)
         if close < 0:
-            return b"\x00unterminated"
+            return b"\x00unterminated", limit
         digits = bytes(b for b in chunk[pos + 1:close] if b not in _WHITESPACE)
         if len(digits) % 2:
             digits += b"0"
         try:
-            return bytes.fromhex(digits.decode("ascii"))
+            return bytes.fromhex(digits.decode("ascii")), close + 1
         except ValueError:
-            return b"\x00unreadable"
-    return None
+            return b"\x00unreadable", close + 1
+    return None, pos
 
 
 def check_pdf(data: bytes, path: str = "") -> list[Finding]:
@@ -147,6 +162,7 @@ def check_pdf(data: bytes, path: str = "") -> list[Finding]:
     if problem:
         add(problem, "a stream has no direct length, or its length does not end where the stream does")
     pages = 0
+    budget = len(data) + MAX_STRING_SLACK  # bytes of strings that may still be read
     for chunk in chunks:
         pages += len(_PAGE.findall(chunk))
         for match in _NAME.finditer(chunk):
@@ -154,9 +170,13 @@ def check_pdf(data: bytes, path: str = "") -> list[Finding]:
             if name in FORBIDDEN_NAMES:
                 add("pdf-active-content", f"/{name} is not allowed in a PDF DocuGen delivers")
             elif name == "URI":
-                value = _string_after(chunk, match.end())
+                value, end = _string_after(chunk, match.end())
                 if value is None:
                     continue  # /S /URI names the kind of action; the address is the /URI entry that holds a string
+                budget -= end - match.end()
+                if budget < 0:
+                    add("pdf-complexity", "the links of the file are written in a way that takes longer to read than the file is long")
+                    return findings
                 text = value.decode("latin-1")
                 if len(text) > MAX_URI_CHARS or not _URI_SCHEME.match(text) or re.search(r"[\x00-\x20\x7f]", text):
                     add("pdf-uri", f"a link that is not an http or https address: {text[:40]!r}")

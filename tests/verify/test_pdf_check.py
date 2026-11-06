@@ -5,10 +5,14 @@ PDFs are built here from bytes, never committed: a hostile one is a few lines, a
 
 from __future__ import annotations
 
+import signal
+import time
+from contextlib import contextmanager
+
 import pytest
 
 from docugen.verify import pdf_check
-from docugen.verify.pdf_check import FORBIDDEN_NAMES, MAX_BYTES, MAX_FINDINGS, MAX_PAGES, MAX_URI_CHARS, check_pdf
+from docugen.verify.pdf_check import FORBIDDEN_NAMES, MAX_BYTES, MAX_FINDINGS, MAX_PAGES, MAX_URI_CHARS, _string_after, check_pdf
 
 HEADER = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n"
 TRAILER = b"xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 1 /Root 1 0 R >>\nstartxref\n0\n%%EOF\n"
@@ -233,3 +237,105 @@ def test_the_limits_are_the_ones_the_tree_check_uses() -> None:
     from docugen.verify import manifest
 
     assert manifest.MAX_PDF_BYTES == pdf_check.MAX_BYTES == 10 * 1024 * 1024
+
+
+# ── the time it takes grows with the size of the file ─────────────────────────────────────────────
+
+@contextmanager
+def deadline(seconds: float):
+    """A check that takes longer than this fails the test instead of hanging it (the quadratic version took minutes for 100 KiB)."""
+    def expired(*_args):
+        raise TimeoutError(f"the check took more than {seconds} s")
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def octal(text: bytes) -> bytes:
+    return b"".join(b"\\%03o" % c for c in text)
+
+
+@pytest.mark.parametrize("label, body", [
+    ("a link started again and again, never ended", b"/URI (" * 1_000_000),
+    ("a hexadecimal link started again and again, never ended", b"/URI <" * 1_000_000),
+    ("links inside links, each valid on its own", (b"/URI (http://a" * 100 + b")" * 100 + b" ") * 5_000),
+    ("links inside links, without a space anywhere", (b"/URI(http://a" * 100 + b")" * 100) * 5_000),
+    ("a link of escapes, many times", b"/URI (" + b"\\1" * 3_000_000),
+    ("a link of closing parentheses", b"/URI (" + b")" * 3_000_000),
+])
+def test_a_file_built_to_make_the_check_slow_is_refused_quickly(label: str, body: bytes) -> None:
+    data = pdf(*page_tree(), obj(5, b"<< " + body + b" >>"))
+    assert len(data) < MAX_BYTES, label
+    with deadline(20):
+        started = time.monotonic()
+        findings = check_pdf(data)
+        elapsed = time.monotonic() - started
+    assert findings, label
+    assert elapsed < 20
+
+
+def test_the_strings_of_the_file_together_cost_at_most_the_file_and_the_slack() -> None:
+    """Many links, each read once, are far below the budget; the same bytes read again and again are over it."""
+    links = b"".join(obj(10 + i, b"<< /S /URI /URI (https://example.com/%d) >>" % i) for i in range(3000))
+    with deadline(20):
+        assert check_pdf(pdf(*page_tree(), links)) == []
+    nested = b"/URI(https://a" * 100 + b")" * 100   # each link valid on its own: no space, an http address, closed
+    few = b"/URI(https://a" * 20 + b")" * 20
+    assert check_pdf(pdf(*page_tree(), obj(5, b"<< " + few + b" >>"))) == [], "a little of it is within the slack"
+    with deadline(20):
+        assert "pdf-complexity" in rules(check_pdf(pdf(*page_tree(), obj(5, b"<< " + nested * 6000 + b" >>"))))
+
+
+def test_a_file_that_is_all_long_links_passes_in_good_time() -> None:
+    """The most a real file can ask of the link check: links of the longest length, filling the file (each is read once)."""
+    link = b"https://example.com/" + b"a" * (MAX_URI_CHARS - len(b"https://example.com/"))
+    objects = [obj(10 + i, b"<< /S /URI /URI (" + link + b") >>") for i in range(4000)]
+    data = pdf(*page_tree(), *objects)
+    assert 8_000_000 < len(data) < MAX_BYTES
+    with deadline(20):
+        assert check_pdf(data) == []
+
+
+def test_a_link_of_the_longest_length_written_entirely_as_escapes_is_still_read_whole() -> None:
+    """Four bytes a character is the most a link can take: it is read whole, and a character more is a link that is too long."""
+    link = b"https://" + b"a" * (MAX_URI_CHARS - len(b"https://"))
+    assert len(link) == MAX_URI_CHARS
+    written = b"(" + octal(link) + b")"
+    assert check_pdf(pdf(*page_tree(), obj(5, b"<< /S /URI /URI " + written + b" >>"))) == []
+    longer = b"(" + octal(link + b"a") + b")"
+    assert rules(check_pdf(pdf(*page_tree(), obj(5, b"<< /S /URI /URI " + longer + b" >>")))) == {"pdf-uri"}
+
+
+@pytest.mark.parametrize("chunk, pos, expected", [
+    (b"(abc)", 0, (b"abc", 5)),
+    (b"  (abc) rest", 0, (b"abc", 7)),                                  # white space first; the end is just after the closing parenthesis
+    (b"()", 0, (b"", 2)),
+    (b"(a(b)c)", 0, (b"a(b)c", 7)),                                     # balanced parentheses nest
+    (b"(a\\(b)", 0, (b"a(b", 6)),                                       # an escaped one does not
+    (b"(a\\)b)", 0, (b"a)b", 6)),
+    (b"(a\\\\b)", 0, (b"a\\b", 6)),
+    (b"(\\150\\164)", 0, (b"ht", 10)),                                   # octal, one to three digits
+    (b"(\\1x)", 0, (b"\x01x", 5)),
+    (b"(a\\\nb)", 0, (b"ab", 6)),                                        # a backslash before a line ending joins the lines
+    (b"(a\\\r\nb)", 0, (b"ab", 7)),
+    (b"(a\\\rb)", 0, (b"ab", 6)),
+    (b"(a\\nb\\tc)", 0, (b"a\nb\tc", 9)),
+    (b"(a\\qb)", 0, (b"aqb", 6)),                                        # an unknown escape is the character
+    (b"<68747470>", 0, (b"http", 10)),
+    (b"< 68 74 74 70 >", 0, (b"http", 15)),
+    (b"<687>", 0, (b"hp", 5)),                                          # an odd number of digits is completed with a 0
+    (b"(abc", 0, (b"\x00unterminated", 4)),
+    (b"<6874", 0, (b"\x00unterminated", 5)),
+    (b"<68zz>", 0, (b"\x00unreadable", 6)),
+    (b"/Name", 0, (None, 0)),                                           # a name or a dictionary is not a string
+    (b"<< /A 1 >>", 0, (None, 0)),
+    (b"12 0 R", 0, (None, 0)),
+    (b"   ", 0, (None, 3)),
+    (b"", 0, (None, 0)),
+])
+def test_the_strings_of_a_pdf_are_read_the_way_a_viewer_reads_them(chunk: bytes, pos: int, expected: tuple[bytes | None, int]) -> None:
+    assert _string_after(chunk, pos) == expected
