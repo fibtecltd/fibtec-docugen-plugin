@@ -78,6 +78,11 @@ def list_tree(root: str) -> tuple[list[str], list[Finding]]:
     return files, findings
 
 
+def is_pdf_path(rel: str) -> bool:
+    """Whether ``rel`` (a normalised relative path) is where a PDF may be: a ``.pdf`` directly under ``docs/pdf/``."""
+    return rel.lower().endswith(PDF_EXTENSION) and rel.startswith(PDF_DIR) and "/" not in rel[len(PDF_DIR):]
+
+
 def _read_pdf(root: str, rel: str) -> bytes | None:
     """The bytes of a PDF of the tree, read without following a link, or None if it cannot be read that way."""
     try:
@@ -105,7 +110,7 @@ def check_tree(root: str, *, allow_pdf: bool = False) -> list[Finding]:
             continue
         if allow_pdf and rel.lower().endswith(PDF_EXTENSION):
             pdfs += 1
-            if not rel.startswith(PDF_DIR) or "/" in rel[len(PDF_DIR):]:
+            if not is_pdf_path(rel):
                 findings.append(Finding("pdf-location", f"PDFs are accepted only directly under {PDF_DIR}", rel))
             elif pdfs <= MAX_PDFS:
                 data = _read_pdf(root, rel)

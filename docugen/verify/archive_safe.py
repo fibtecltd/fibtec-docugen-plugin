@@ -22,6 +22,7 @@ import posixpath
 import re
 import tarfile
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import IO
 
@@ -132,9 +133,10 @@ def detect_format(path: str) -> str:
 
 
 class _Extractor:
-    def __init__(self, dest: str, limits: Limits) -> None:
+    def __init__(self, dest: str, limits: Limits, binary_ok: Callable[[str], bool] | None = None) -> None:
         self.dest = os.path.realpath(dest)
         self.limits = limits
+        self.binary_ok = binary_ok
         self.result = ExtractResult()
         self.members = 0
         self.seen: dict[str, bool] = {}  # casefolded path -> is_dir
@@ -183,7 +185,7 @@ class _Extractor:
             self.result.skipped.append((rel, reason))
             return
         first = src.read(_SNIFF_BYTES)
-        if b"\x00" in first:
+        if b"\x00" in first and not (self.binary_ok is not None and self.binary_ok(rel)):
             self.result.skipped.append((rel, "binary"))
             return
         target = os.path.join(self.dest, rel)
@@ -285,8 +287,14 @@ def _extract_tar(path: str, ex: _Extractor, mode: str) -> None:
             raise UnsafeArchive("bad-archive", f"unreadable tar data: {type(exc).__name__}") from exc
 
 
-def safe_extract(archive: str, dest: str, limits: Limits | None = None) -> ExtractResult:
+def safe_extract(archive: str, dest: str, limits: Limits | None = None, *,
+                 binary_ok: Callable[[str], bool] | None = None) -> ExtractResult:
     """Extract ``archive`` into the existing, empty directory ``dest`` or raise ``UnsafeArchive``.
+
+    A member whose first bytes hold a NUL is binary and is skipped (it is a source being read for a model, and a model reads text).
+    ``binary_ok`` names the members that are binary on purpose: a function of the normalised relative path, true for the ones to
+    extract anyway. The default is none. The box's output is the one caller that has any: its PDFs, which always hold NULs
+    (``manifest.is_pdf_path``), and only when the session asked for them. Every other check still applies to what it lets through.
 
     On failure ``dest`` may hold a partial tree: the caller discards it.
     """
@@ -296,7 +304,7 @@ def safe_extract(archive: str, dest: str, limits: Limits | None = None) -> Extra
     if not os.path.isdir(dest) or os.listdir(dest):
         raise UnsafeArchive("bad-destination", "destination must be an existing empty directory")
     kind = detect_format(archive)
-    ex = _Extractor(dest, limits)
+    ex = _Extractor(dest, limits, binary_ok)
     if kind == "zip":
         _extract_zip(archive, ex)
     elif kind == "tar.gz":

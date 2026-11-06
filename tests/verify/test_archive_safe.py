@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from docugen.verify.archive_safe import Limits, UnsafeArchive, check_archive, safe_extract
+from docugen.verify.manifest import is_pdf_path
 
 
 def make_zip(path: Path, members: dict[str, bytes | str], *, mutate=None) -> Path:
@@ -85,6 +86,63 @@ def test_skipped_files_are_recorded_not_extracted(tmp_path: Path, dest: str) -> 
     reasons = dict(res.skipped)
     assert reasons[".env"] == "secret-file" and reasons["keys/id_rsa"] == "secret-file"
     assert reasons["logo.png"] == "binary" and reasons[".git/config"].startswith("directory:")
+
+
+# ── binary members that are binary on purpose (the box's PDFs) ─────────────────────────────────
+
+PDF_BYTES = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<< /Length 4 >>\nstream\n\x00\x01\x02\x03\nendstream\nendobj\n%%EOF\n"
+
+
+def is_flat_pdf(rel: str) -> bool:
+    return is_pdf_path(rel)
+
+
+def test_a_member_with_a_nul_is_binary_and_skipped_by_default(tmp_path: Path, dest: str) -> None:
+    z = make_zip(tmp_path / "a.zip", {"docs/pdf/a.pdf": PDF_BYTES, "docs/index.md": "# T\n"})
+    res = safe_extract(str(z), dest)
+    assert dict(res.skipped) == {"docs/pdf/a.pdf": "binary"} and not (Path(dest) / "docs" / "pdf").exists()
+
+
+def test_a_binary_member_the_caller_names_is_extracted_whole(tmp_path: Path, dest: str) -> None:
+    z = make_zip(tmp_path / "a.zip", {"docs/pdf/a.pdf": PDF_BYTES, "docs/index.md": "# T\n"})
+    res = safe_extract(str(z), dest, binary_ok=is_flat_pdf)
+    assert res.skipped == [] and res.files == 2
+    assert (Path(dest) / "docs" / "pdf" / "a.pdf").read_bytes() == PDF_BYTES
+
+
+def test_only_the_members_the_caller_names_are_let_through(tmp_path: Path, dest: str) -> None:
+    z = make_zip(tmp_path / "a.zip", {
+        "docs/pdf/a.pdf": PDF_BYTES, "docs/pdf/sub/b.pdf": PDF_BYTES, "docs/other.pdf": PDF_BYTES,
+        "docs/pdf/c.bin": b"\x00\x01", "docs/index.md": b"# T\n\x00", "docs/logo.png": b"\x89PNG\x00",
+    })
+    res = safe_extract(str(z), dest, binary_ok=is_flat_pdf)
+    assert dict(res.skipped) == {"docs/pdf/sub/b.pdf": "binary", "docs/other.pdf": "binary", "docs/pdf/c.bin": "binary",
+                                 "docs/index.md": "binary", "docs/logo.png": "binary"}
+    assert sorted(p.relative_to(dest).as_posix() for p in Path(dest).rglob("*") if p.is_file()) == ["docs/pdf/a.pdf"]
+
+
+def test_the_other_limits_still_apply_to_a_binary_member_that_is_let_through(tmp_path: Path, dest: str) -> None:
+    big = PDF_BYTES + b"\x00" * (2 * 1024 * 1024)
+    z = make_zip(tmp_path / "a.zip", {"docs/pdf/a.pdf": big})
+    with pytest.raises(UnsafeArchive) as excinfo:
+        safe_extract(str(z), dest, Limits(max_member_bytes=1024 * 1024), binary_ok=is_flat_pdf)
+    assert excinfo.value.rule == "member-too-large"
+
+
+def test_the_predicate_is_given_the_normalised_path(tmp_path: Path, dest: str) -> None:
+    seen: list[str] = []
+    t = make_tar(tmp_path / "a.tar.gz", [tinfo("./", type_=tarfile.DIRTYPE), tinfo("./docs/pdf/a.pdf", PDF_BYTES)])
+    safe_extract(str(t), dest, binary_ok=lambda rel: seen.append(rel) or True)
+    assert seen == ["docs/pdf/a.pdf"]
+
+
+@pytest.mark.parametrize("rel, expected", [
+    ("docs/pdf/a.pdf", True), ("docs/pdf/A.PDF", True), ("docs/pdf/a b-c_d.1.pdf", True),
+    ("docs/pdf/sub/a.pdf", False), ("docs/pdf/.pdf", True), ("docs/a.pdf", False), ("a.pdf", False), ("docs/pdf/a.pdf.md", False),
+    ("docs/pdf/a.txt", False), ("docs/pdf/", False), ("docs/PDF/a.pdf", False), ("other/docs/pdf/a.pdf", False), ("docs/pdf", False),
+])
+def test_where_a_pdf_may_be(rel: str, expected: bool) -> None:
+    assert is_pdf_path(rel) is expected
 
 
 # ── hostile zips ─────────────────────────────────────────────────────────────────────────────────
