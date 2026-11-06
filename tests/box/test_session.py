@@ -84,12 +84,13 @@ class World:
         self.environ["FAKE_STREAM"] = str(stream_file(self.tmp, events))
         self.environ["FAKE_EXIT"] = str(agent_exit)
 
-    def run(self, *, argv: list[str] | None = None, tools: str | None = None, scratch: str | None = None) -> tuple[int, list[str]]:
+    def run(self, *, argv: list[str] | None = None, tools: str | None = None, scratch: str | None = None,
+            **extra: Any) -> tuple[int, list[str]]:
         out = io.StringIO()
         argv = argv if argv is not None else [sys.executable, str(FAKE), "-p", "go"]
         rc = session.run_session(argv, self.environ, src_dir=str(self.src), out_dir=str(self.out), work_dir=str(self.work),
                                  tools_file=tools or str(self.tmp / "no-tools.json"), out=out, now=NOW, drop_privileges=False,
-                                 scratch_dir=scratch)
+                                 scratch_dir=scratch, **extra)
         return rc, out.getvalue().splitlines()
 
 

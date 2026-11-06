@@ -248,6 +248,13 @@ def test_pdfs_may_be_bigger_than_other_files_up_to_their_own_cap(tmp_path: Path)
     assert rules(check_tree(str(out), allow_pdf=True)) == {"file-too-large"}
 
 
+def test_exactly_the_cap_of_pdfs_is_accepted(tmp_path: Path) -> None:
+    out, _, manifest = build(tmp_path)
+    for i in range(MAX_PDFS):
+        add_pdf(out, manifest, f"d{i:03d}.pdf")
+    assert check_tree(str(out), allow_pdf=True) == []
+
+
 def test_the_number_of_pdfs_is_capped(tmp_path: Path) -> None:
     out, _, manifest = build(tmp_path)
     for i in range(MAX_PDFS + 1):

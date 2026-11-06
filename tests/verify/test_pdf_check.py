@@ -118,6 +118,16 @@ def test_a_length_that_spans_a_hidden_object_behind_a_false_end_is_refused() -> 
     assert rules(check_pdf(data)) == {"pdf-stream-length"}
 
 
+def test_a_false_stream_end_alone_inside_the_data_is_refused() -> None:
+    body = b"x\nendstream\n6 0 obj\n<< /S /Launch >>\n"                      # no endobj: only the early endstream gives it away
+    data = pdf(*page_tree(), b"5 0 obj\n<< /Length %d >>\nstream\n" % len(body) + body + b"\nendstream\nendobj\n")
+    assert rules(check_pdf(data)) == {"pdf-stream-length"}
+
+
+def test_a_stream_that_is_longer_than_its_length_is_refused() -> None:
+    assert rules(check_pdf(pdf(*page_tree(), stream(5, b"abc", length=1)))) == {"pdf-stream-length"}
+
+
 def test_a_false_object_end_inside_the_data_is_refused_too() -> None:
     body = b"x\nendobj\n6 0 obj\n<< /S /Launch >>\nendobj\n"
     data = pdf(*page_tree(), b"5 0 obj\n<< /Length %d >>\nstream\n" % len(body) + body + b"\nendstream\nendobj\n")
@@ -128,7 +138,7 @@ def test_a_stream_whose_length_is_long_is_refused_too() -> None:
     assert rules(check_pdf(pdf(*page_tree(), stream(5, b"abc", length=999)))) == {"pdf-stream-length"}
 
 
-@pytest.mark.parametrize("entries", [b"/Length 12 0 R ", b""])
+@pytest.mark.parametrize("entries", [b"/Length 3 0 R ", b"/Length 12 0 R ", b""])       # the first one is the right number, indirectly
 def test_a_stream_with_an_indirect_or_missing_length_is_refused(entries: bytes) -> None:
     data = pdf(*page_tree(), b"5 0 obj\n<< " + entries + b">>\nstream\nabc\nendstream\nendobj\n")
     assert rules(check_pdf(data)) == {"pdf-stream-length"}
@@ -186,6 +196,12 @@ def test_the_end_marker_must_be_at_the_end() -> None:
 def test_a_file_over_the_size_cap_is_refused_without_being_read() -> None:
     findings = check_pdf(b"%PDF-1.7\n" + b"0" * MAX_BYTES + b"\n%%EOF\n")
     assert [f.rule for f in findings] == ["pdf-too-large"]
+
+
+def test_the_size_cap_is_exact() -> None:
+    filler = MAX_BYTES - len(b"%PDF-1.7\n") - len(b"\n%%EOF\n")
+    assert check_pdf(b"%PDF-1.7\n" + b"0" * filler + b"\n%%EOF\n") == []
+    assert [f.rule for f in check_pdf(b"%PDF-1.7\n" + b"0" * (filler + 1) + b"\n%%EOF\n")] == ["pdf-too-large"]
 
 
 def test_the_page_cap() -> None:
