@@ -5,6 +5,10 @@
 manifest, plain ASCII path characters, and bounded count and size. Anything else means the box wrote
 somewhere it should not, or produced a file type the product does not deliver.
 
+PDFs are the one file type the agent never writes: the box prints them itself, after the agent has stopped, when the session
+asked for them. So ``check_tree`` refuses a ``.pdf`` unless it is called with ``allow_pdf=True``, and then accepts one only
+directly under ``docs/pdf/`` and only if ``pdf_check`` finds nothing in its bytes.
+
 ``check_manifest`` validates ``docs/.docugen/manifest.json``: the commit or archive the documents were
 generated from, the tools used, and for each document the hash of the document and of every source file
 it was derived from. Given the source tree it also verifies those source hashes, so a manifest cannot
@@ -19,18 +23,23 @@ import os
 import re
 import stat
 
+from . import pdf_check
 from .common import Finding
 
 MANIFEST_PATH = "docs/.docugen/manifest.json"
 ALLOWED_EXTENSIONS = (".md", ".mmd", ".puml", ".svg")
+PDF_EXTENSION = ".pdf"
+PDF_DIR = "docs/pdf/"
 MAX_FILES = 2000
+MAX_PDFS = 100
 MAX_FILE_BYTES = 5 * 1024 * 1024
+MAX_PDF_BYTES = pdf_check.MAX_BYTES
 MAX_PATH_CHARS = 200
 _SAFE_PATH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]*(?:/[A-Za-z0-9][A-Za-z0-9._ -]*)*$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _RFC3339 = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$")
-DOCUMENT_KINDS = ("markdown", "diagram-source", "diagram-svg")
+DOCUMENT_KINDS = ("markdown", "diagram-source", "diagram-svg", "pdf")
 
 
 def sha256_file(path: str) -> str:
@@ -63,16 +72,28 @@ def list_tree(root: str) -> tuple[list[str], list[Finding]]:
                     findings.append(Finding("executable", "executable bit set", rel))
                 if st.st_nlink > 1:
                     findings.append(Finding("hard-link", "file has more than one link", rel))
-                if st.st_size > MAX_FILE_BYTES:
-                    findings.append(Finding("file-too-large", f"file over {MAX_FILE_BYTES} bytes", rel))
+                limit = MAX_PDF_BYTES if rel.lower().endswith(PDF_EXTENSION) else MAX_FILE_BYTES
+                if st.st_size > limit:
+                    findings.append(Finding("file-too-large", f"file over {limit} bytes", rel))
     return files, findings
 
 
-def check_tree(root: str) -> list[Finding]:
+def _read_pdf(root: str, rel: str) -> bytes | None:
+    """The bytes of a PDF of the tree, read without following a link, or None if it cannot be read that way."""
+    try:
+        fd = os.open(os.path.join(root, rel), os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    with os.fdopen(fd, "rb") as fh:
+        return fh.read(MAX_PDF_BYTES + 1)
+
+
+def check_tree(root: str, *, allow_pdf: bool = False) -> list[Finding]:
     files, findings = list_tree(root)
     if len(files) > MAX_FILES:
         findings.append(Finding("too-many-files", f"more than {MAX_FILES} files"))
     seen: dict[str, str] = {}
+    pdfs = 0
     for rel in files:
         if rel == MANIFEST_PATH:
             continue
@@ -82,12 +103,24 @@ def check_tree(root: str) -> list[Finding]:
         if len(rel) > MAX_PATH_CHARS or not _SAFE_PATH.match(rel):
             findings.append(Finding("path-characters", "path has characters outside A-Za-z0-9._ -/", rel))
             continue
-        if not rel.lower().endswith(ALLOWED_EXTENSIONS):
+        if allow_pdf and rel.lower().endswith(PDF_EXTENSION):
+            pdfs += 1
+            if not rel.startswith(PDF_DIR) or "/" in rel[len(PDF_DIR):]:
+                findings.append(Finding("pdf-location", f"PDFs are accepted only directly under {PDF_DIR}", rel))
+            elif pdfs <= MAX_PDFS:
+                data = _read_pdf(root, rel)
+                if data is None:
+                    findings.append(Finding("pdf-unreadable", "the PDF cannot be read as a regular file", rel))
+                else:
+                    findings.extend(pdf_check.check_pdf(data, rel))
+        elif not rel.lower().endswith(ALLOWED_EXTENSIONS):
             findings.append(Finding("extension", f"extension not delivered: {os.path.splitext(rel)[1]!r}", rel))
         key = rel.casefold()
         if key in seen:
             findings.append(Finding("duplicate-path", f"differs only by case from {seen[key]}", rel))
         seen[key] = rel
+    if pdfs > MAX_PDFS:
+        findings.append(Finding("too-many-pdfs", f"more than {MAX_PDFS} PDFs"))
     return findings
 
 
@@ -96,9 +129,11 @@ def _is_rel_path(value: object) -> bool:
             and ".." not in value.split("/") and "\\" not in value and "\x00" not in value)
 
 
-def check_manifest(manifest: object, root: str | None = None, source_root: str | None = None) -> list[Finding]:
+def check_manifest(manifest: object, root: str | None = None, source_root: str | None = None, *,
+                   allow_pdf: bool = False) -> list[Finding]:
     """Validate a parsed manifest. With ``root`` it also checks the documents on disk; with
-    ``source_root`` it also checks the hashes of the source files."""
+    ``source_root`` it also checks the hashes of the source files. A document of kind ``pdf`` is accepted only with
+    ``allow_pdf``, and a PDF only is of kind ``pdf``: the kind and the extension must agree."""
     p = MANIFEST_PATH
     out: list[Finding] = []
 
@@ -139,6 +174,10 @@ def check_manifest(manifest: object, root: str | None = None, source_root: str |
         listed.add(path)
         if d.get("kind") not in DOCUMENT_KINDS:
             bad("manifest-document", f"{where}.kind must be one of {DOCUMENT_KINDS}")
+        elif d["kind"] == "pdf" and not allow_pdf:
+            bad("manifest-pdf", f"{where}: a PDF is listed but none was asked for")
+        if (d.get("kind") == "pdf") != path.lower().endswith(PDF_EXTENSION):
+            bad("manifest-pdf", f"{where}: kind and extension disagree ({path})")
         if not _SHA256.match(str(d.get("sha256", ""))):
             bad("manifest-document", f"{where}.sha256 must be 64 hex characters")
         sources = d.get("sources")
