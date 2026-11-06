@@ -256,3 +256,39 @@ def test_the_standard_library_and_the_validators_only() -> None:
     imported = {n.names[0].name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import)}
     imported |= {n.module.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module and n.level == 0}
     assert imported <= set(sys.stdlib_module_names) | {"__future__", "docugen"}, imported
+
+
+# ── PDFs: derived from documents, so they cite the sources of the documents they were printed from ──────────
+
+def test_a_pdf_cites_the_sources_of_the_documents_it_was_printed_from(trees: tuple[Path, Path]) -> None:
+    src, out = trees
+    put(out, {"docs/pdf/documentation.pdf": b"%PDF-1.7\n", "docs/pdf/api.pdf": b"%PDF-1.7\n%x\n", "docs/pdf/index.pdf": b"%PDF-1.7\n%y\n"})
+    printed_from = {"docs/pdf/documentation.pdf": ("index.md", "api.md"), "docs/pdf/api.pdf": ("api.md",), "docs/pdf/index.pdf": ("index.md",)}
+    manifest, _ = build(src, out, pdf_documents=printed_from)
+    entries = {d["path"]: d for d in manifest["documents"]}
+    paths = {name: [s["path"] for s in entries[name]["sources"]] for name in printed_from}
+    assert paths == {"docs/pdf/documentation.pdf": ["README.md", "app/api.py", "app/models.py", "infra/stack.py"],
+                     "docs/pdf/api.pdf": ["app/api.py", "infra/stack.py"], "docs/pdf/index.pdf": ["README.md", "app/api.py", "app/models.py"]}
+    assert all(entries[name]["kind"] == "pdf" for name in printed_from)
+    assert check_manifest(manifest, root=str(out), source_root=str(src), allow_pdf=True) == []
+
+
+def test_a_pdf_nobody_accounted_for_takes_the_sources_of_every_document(trees: tuple[Path, Path]) -> None:
+    src, out = trees
+    put(out, {"docs/pdf/other.pdf": b"%PDF-1.7\n"})
+    manifest, _ = build(src, out)
+    entry = next(d for d in manifest["documents"] if d["path"] == "docs/pdf/other.pdf")
+    assert [s["path"] for s in entry["sources"]] == ["README.md", "app/api.py", "app/models.py", "infra/stack.py"]
+
+
+def test_a_pdf_whose_documents_are_unknown_to_the_tree_takes_no_source(trees: tuple[Path, Path]) -> None:
+    src, out = trees
+    put(out, {"docs/pdf/ghost.pdf": b"%PDF-1.7\n"})
+    manifest, _ = build(src, out, pdf_documents={"docs/pdf/ghost.pdf": ("nothing.md",)})
+    entry = next(d for d in manifest["documents"] if d["path"] == "docs/pdf/ghost.pdf")
+    assert entry["sources"] == []
+
+
+def test_a_tree_without_pdfs_builds_the_same_manifest_as_before(trees: tuple[Path, Path]) -> None:
+    src, out = trees
+    assert all(d["kind"] != "pdf" for d in build(src, out)[0]["documents"])

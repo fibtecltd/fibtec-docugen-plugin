@@ -12,8 +12,8 @@ commit, with no credentials.
 | Path | What it is |
 |---|---|
 | `plugins/docugen-box/` | the Claude Code plugin the agent runs under inside the DocuGen box (a sealed container, one per documentation session; source read-only, no inbound connections, outbound HTTPS only): the session contract, the verify skill and `docugen-src` |
-| `docugen/verify/` | the validators, standard library only: they decide what may enter DocuGen (uploaded archives, secrets) and what may leave it (Markdown, SVG, diagram sources, the output tree and its provenance manifest). The same code runs in the box, in the delivery step and in CI |
-| `docugen/box/` | what runs around the agent in the box: the status vocabulary, the supervisor that lets nothing but status lines out of a session, the transfer of source in and output out, and the provenance manifest |
+| `docugen/verify/` | the validators, standard library only: they decide what may enter DocuGen (uploaded archives, secrets) and what may leave it (Markdown, SVG, diagram sources, PDFs, the output tree and its provenance manifest). The same code runs in the box, in the delivery step and in CI |
+| `docugen/box/` | what runs around the agent in the box: the status vocabulary, the supervisor that lets nothing but status lines out of a session, the transfer of source in and output out, the provenance manifest, and the printing of PDFs |
 | `tests/` | the tests of all three, with hostile inputs built in code rather than committed |
 
 ### The plugin: `plugins/docugen-box`
@@ -49,12 +49,15 @@ docugen-src grep 'class \w+' --glob '*.py' -C 1
 | `md_policy` | whether generated Markdown is inert: no raw HTML but a few attribute-free tags, no remote images, only safe link schemes and in-repository relative paths, no bidirectional or hidden characters |
 | `svg_sanitize` | allowlist rebuild of rendered SVG: no scripts, `foreignObject`, remote references, event handlers, DOCTYPE or entities |
 | `diagram_check` | Mermaid and PlantUML source policy (no includes, URLs, environment access, `click`, security directives; supported types only) and a render check through the installed tool |
-| `manifest` | the shape of the output (`docs/**` only, fixed extensions, no symlinks or executable bits) and its provenance manifest (commit or archive hash, tools, document and source hashes) |
+| `manifest` | the shape of the output (`docs/**` only, fixed extensions, no symlinks or executable bits) and its provenance manifest (commit or archive hash, tools, document and source hashes). PDFs are accepted only when asked for (`allow_pdf`), directly under `docs/pdf/` |
+| `pdf_check` | a fail-closed scan of a PDF's bytes: no JavaScript, launch or submit actions, attachments, forms, media, encryption or object streams (names are decoded first, so `/J#61vaScript` is found), every stream's `/Length` exact with no `endstream` or `endobj` inside it, links only to http or https addresses, size and page caps, and a time that grows with the size of the file (a file built so that its links must be read again and again is refused as `pdf-complexity`) |
 
 ```bash
 python3 -P -m docugen.verify markdown docs/            # exit 0 clean, 1 findings, 2 usage; --json for machines
 python3 -P -m docugen.verify archive upload.zip
 python3 -P -m docugen.verify tree out/ --source src/   # output allowlist + manifest + source hashes
+python3 -P -m docugen.verify tree out/ --source src/ --allow-pdf   # the same, for a session that asked for PDFs
+python3 -P -m docugen.verify pdf docs/pdf/              # exit 0 clean, 1 findings
 ```
 
 `-P` (or `-I` once installed) keeps the working directory off `sys.path`, so a file named `json.py` in the directory
@@ -128,11 +131,39 @@ does not have. A diagram and its rendering take the sources of the Markdown docu
 2. **The agent**, through the supervisor, with every `DOCUGEN_*` variable removed from its environment: it never holds a
    presigned URL.
 3. **Post-step**, only if the session ended `DONE` or `LIMIT_REACHED`: check the output tree (`docs/**`, fixed extensions,
-   no links or executables, at least one document), build the provenance manifest and check it against the source, pack
-   `docs/` and the manifest into one reproducible tar and upload it. A `LIMIT_REACHED` session still packs what it has;
-   whether partial output is delivered is the deliver step's decision.
+   no links or executables, no PDF, at least one document), print PDFs if the session asked for them (below), build the
+   provenance manifest and check it against the source, pack `docs/` and the manifest into one reproducible tar and upload
+   it. A `LIMIT_REACHED` session still packs what it has; whether partial output is delivered is the deliver step's
+   decision.
 
-Between the agent and the terminal line it prints `STATUS: PACKAGING` and `OUTPUT: documents=N bytes=N unresolved_sources=N`.
+Between the agent and the terminal line it prints `STATUS: PACKAGING` and `OUTPUT: documents=N bytes=N unresolved_sources=N`
+(with ` pdfs=N`, and ` pdf_error=WORD`, for a session that asked for PDFs; `documents` does not count them).
+
+### PDFs: `docugen/box/pdf.py`
+
+`DOCUGEN_PDF` (`none`, the default when it is absent, `each`, `combined` or `both`) is the orchestrator's choice and, like
+every `DOCUGEN_*` variable, never reaches the agent, which cannot write a PDF either: its output is checked without PDFs
+allowed. After the agent has stopped, trusted code does the printing:
+
+1. The agent's documents (`docs/**`, regular files only, read without following a link) are copied into a private tree that
+   the printer can read and cannot change.
+2. The printer, `docugen-pdf` (in the box image: Chromium and a Markdown renderer, see `claude-docker-ecs`), runs as the
+   unprivileged user with an empty environment, a time limit, and exactly one place to write. It is told what to print:
+
+   ```
+   docugen-pdf --in DIR --out DIR --source-id TEXT --generated-at RFC3339 --generator-version TEXT
+               --doc PATH [--doc PATH ...]   [--combined NAME.pdf]   [--single PATH=NAME.pdf ...]
+   ```
+
+   `--doc` lists the Markdown documents in reading order: `README.md`, `onboarding.md`, `architecture.md`,
+   `api-reference.md`, then any other in path order. `--combined` is `documentation.pdf`; `--single` names the PDF of one
+   document after its path (`guides/setup.md` is `guides-setup.pdf`). All land in `docs/pdf/`.
+3. Every file it wrote is read back and checked by `pdf_check`. If any is wrong, none is kept.
+4. The manifest lists each PDF as kind `pdf`, with the source files of the documents it was printed from.
+
+Printing is an extra, not the product: if it cannot be done (no printer in the image, it fails or hangs, a file is not
+acceptable, the result would be too big for the upload) the documents are delivered anyway and the `OUTPUT` line says that
+no PDF was made and why, in one word of `pdf.ERRORS`.
 Failures use the codes of the status vocabulary: `NO_SOURCE` (the source is gone or empty), `TOO_LARGE` (a size cap),
 `VALIDATION` (the output is not an acceptable tree), `INTERNAL` (anything else). **A failure before the agent starts means
 the agent never runs; a failure after it is `FAILED` whatever the agent claimed.** Any unexpected exception is
@@ -174,6 +205,8 @@ accept it unchanged, so a renderer upgrade that adds an attribute fails there an
 
 - `svg_sanitize` refuses `foreignObject`, so Mermaid must render labels without it (`htmlLabels: false`).
 - `diagram_check` has no grounding gate yet (identifiers cited by a diagram against the fact index).
+- `pdf_check` reads only the plain structure a printer such as Chromium writes. It refuses object streams and anything else it
+  cannot scan, so a PDF made by another tool, or by Chromium with different settings, may be refused although it is harmless.
 - Markdown checks are line-based and conservative: a tag outside the small allowlist is a finding even in prose.
 
 ## Licence

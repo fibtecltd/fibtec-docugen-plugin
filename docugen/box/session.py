@@ -9,8 +9,9 @@ by trusted code that the agent cannot call:
 2. **The agent**, through the supervisor (``supervise.execute``), with every ``DOCUGEN_*`` variable removed from its
    environment: it must never hold the presigned URLs, which are bearer secrets.
 3. **Post-step**, only if the session ended ``DONE`` or ``LIMIT_REACHED``. Check the output tree against the allowlist
-   (``docs/**``, fixed extensions, no links or executables), build and check the provenance manifest, pack ``docs/`` and
-   the manifest into one reproducible tar and upload it to the presigned POST.
+   (``docs/**``, fixed extensions, no links or executables), print PDFs if the session asked for them (``pdf``: the agent
+   never does), build and check the provenance manifest, pack ``docs/`` and the manifest into one reproducible tar and
+   upload it to the presigned POST.
 
 Failures are mapped onto the codes of the status vocabulary and nothing else leaves the box: ``NO_SOURCE`` (nothing to
 fetch or nothing to document), ``TOO_LARGE`` (a size cap), ``VALIDATION`` (the output is not an acceptable tree),
@@ -19,7 +20,8 @@ reports ``FAILED`` whatever the agent claimed. A ``LIMIT_REACHED`` session still
 partial output is delivered is the deliver step's decision, not the box's.
 
 Between the agent and the terminal line the post-step prints ``STATUS: PACKAGING`` and one line of numbers,
-``OUTPUT: documents=N bytes=N unresolved_sources=N``.
+``OUTPUT: documents=N bytes=N unresolved_sources=N``. A session that asked for PDFs adds ``pdfs=N``, and ``pdf_error=WORD`` when
+it asked and none was made (``pdf.ERRORS``): the documents are delivered either way.
 
 Two privilege models, chosen by who runs this process:
 
@@ -44,16 +46,19 @@ import os
 import re
 import stat
 import sys
+import shutil
 import tarfile
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import IO
 
 import docugen
 from docugen.verify.archive_safe import Limits, UnsafeArchive, safe_extract
 from docugen.verify.manifest import MANIFEST_PATH, check_manifest, check_tree, list_tree
 
+from . import pdf as printing
 from . import status, supervise, transfer
 from .provenance import SourceInfo, build_manifest, manifest_bytes
 from .supervise import EXIT_FAILED, EXIT_USAGE, UsageError, Verdict
@@ -62,6 +67,7 @@ MAX_SOURCE_BYTES = Limits().max_archive_bytes
 MAX_OUTPUT_BYTES = 25 * 1024 * 1024
 DEFAULT_SRC, DEFAULT_OUT, DEFAULT_WORK = "/workspace/src", "/workspace/out", "/workspace/work"
 DEFAULT_SCRATCH = "/run/docugen"  # root only; not under /workspace, which the agent can write
+DEFAULT_PDF_PARENT = "/run/docugen-pdf"  # readable by the agent's user: the printer, which runs as that user, reads its input here
 DEFAULT_TOOLS_FILE = "/opt/docugen/etc/tools.json"
 DEFAULT_AGENT_ID = 1001           # the image's user `claude`
 AGENT_NAME, AGENT_HOME = "claude", "/home/claude"
@@ -90,6 +96,7 @@ class SessionConfig:
     out_url: str
     out_fields: dict[str, str]
     source: SourceInfo
+    pdf: str = "none"   # none, each, combined or both (pdf.MODES): the orchestrator's choice, never the agent's
 
     @classmethod
     def from_environ(cls, environ: Mapping[str, str]) -> SessionConfig:
@@ -106,7 +113,11 @@ class SessionConfig:
             raise ConfigError("the source description is missing or malformed") from None
         except transfer.TransferError as exc:
             raise ConfigError(f"a session URL or the upload fields are not acceptable ({exc.code})") from None
-        return cls(session_id, source_url, out_url, fields, source)
+        try:
+            pdf = printing.parse_mode(environ.get("DOCUGEN_PDF"))
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from None
+        return cls(session_id, source_url, out_url, fields, source, pdf)
 
 
 @dataclass(frozen=True)
@@ -140,12 +151,28 @@ def agent_identity(environ: Mapping[str, str], euid: int) -> AgentIdentity | Non
 
 @dataclass(frozen=True)
 class OutputSummary:
-    documents: int
+    documents: int          # without the PDFs
     bytes: int
     unresolved_sources: int
+    pdfs: int | None = None          # None: none were asked for
+    pdf_error: str | None = None     # one of pdf.ERRORS when some were asked for and none was made
 
     def line(self) -> str:
-        return f"OUTPUT: documents={self.documents} bytes={self.bytes} unresolved_sources={self.unresolved_sources}"
+        line = f"OUTPUT: documents={self.documents} bytes={self.bytes} unresolved_sources={self.unresolved_sources}"
+        if self.pdfs is not None:
+            line += f" pdfs={self.pdfs}"
+        if self.pdf_error is not None:
+            line += f" pdf_error={self.pdf_error}"
+        return line
+
+
+@dataclass(frozen=True)
+class Printer:
+    """How PDFs are printed: the tool, who it runs as (a ``(uid, gid)``, None for this user) and where its tree is made."""
+
+    tool: str = printing.DEFAULT_TOOL
+    user: tuple[int, int] | None = None
+    parent: str | None = None   # default: the scratch directory
 
 
 def load_tools(path: str) -> dict[str, str]:
@@ -242,36 +269,66 @@ def package(out_dir: str, dest: str, manifest_json: bytes) -> int:
     return size
 
 
+def _source_id(source: SourceInfo) -> str:
+    return f"github:{source.commit}" if source.kind == "github" else f"zip:sha256:{source.archive_sha256}"
+
+
 def post_step(config: SessionConfig, src_dir: str, out_dir: str, scratch_dir: str, tools: dict[str, str],
-              out: IO[str], now: datetime | None = None) -> OutputSummary:
-    """Check, document the provenance of, pack and upload the output. Raises ``StepFailed``. Writes nothing in ``out_dir``."""
+              out: IO[str], now: datetime | None = None, printer: Printer | None = None) -> OutputSummary:
+    """Check, print PDFs if asked, document the provenance of, pack and upload the output. Raises ``StepFailed``.
+
+    Writes nothing in ``out_dir``: with PDFs it works on a private copy of the documents, which is removed at the end.
+    """
     out.write(status.format_status("PACKAGING") + "\n")
     out.flush()
-    if check_tree(out_dir):
+    if check_tree(out_dir):  # the agent's output: no PDF may be in it, whatever was asked for
         raise StepFailed("VALIDATION")
-    manifest, unresolved = build_manifest(out_dir, src_dir, config.source, generator_version=docugen.__version__,
-                                          tools=tools, now=now)
-    if not manifest["documents"]:
-        raise StepFailed("VALIDATION")  # nothing to deliver
-    if check_manifest(manifest, root=out_dir, source_root=src_dir):
-        raise StepFailed("INTERNAL")
-    archive = os.path.join(scratch_dir, "docs.tar")
+    moment = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    tree, printed, work = out_dir, None, None
     try:
-        size = package(out_dir, archive, manifest_bytes(manifest))
-        transfer.upload(config.out_url, config.out_fields, archive, MAX_OUTPUT_BYTES)
-    except transfer.TransferError as exc:
-        raise StepFailed("TOO_LARGE" if exc.code == transfer.TransferError.TOO_LARGE else "INTERNAL") from None
-    finally:
+        if config.pdf != "none":
+            printer = printer or Printer()
+            parent = printer.parent or scratch_dir
+            os.makedirs(parent, mode=0o755, exist_ok=True)
+            if printer.user is not None:
+                os.chmod(parent, 0o755)
+            work = tempfile.mkdtemp(prefix="pdf-", dir=parent)
+            printed = printing.print_documents(
+                config.pdf, out_dir, work, source_id=_source_id(config.source), generated_at=moment.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                generator_version=docugen.__version__, tool=printer.tool, user=printer.user, max_output_bytes=MAX_OUTPUT_BYTES)
+            if printed.stage is not None:
+                tree = printed.stage
+        has_pdfs = tree is not out_dir
+        manifest, unresolved = build_manifest(tree, src_dir, config.source, generator_version=docugen.__version__, tools=tools,
+                                              now=moment, pdf_documents=printed.printed_from if has_pdfs and printed else None)
+        if not manifest["documents"]:
+            raise StepFailed("VALIDATION")  # nothing to deliver
+        if has_pdfs and check_tree(tree, allow_pdf=True):
+            raise StepFailed("VALIDATION")
+        if check_manifest(manifest, root=tree, source_root=src_dir, allow_pdf=has_pdfs):
+            raise StepFailed("INTERNAL")
+        archive = os.path.join(scratch_dir, "docs.tar")
         try:
-            os.unlink(archive)
-        except FileNotFoundError:
-            pass
-    return OutputSummary(len(manifest["documents"]), size, len(unresolved))
+            size = package(tree, archive, manifest_bytes(manifest))
+            transfer.upload(config.out_url, config.out_fields, archive, MAX_OUTPUT_BYTES)
+        except transfer.TransferError as exc:
+            raise StepFailed("TOO_LARGE" if exc.code == transfer.TransferError.TOO_LARGE else "INTERNAL") from None
+        finally:
+            try:
+                os.unlink(archive)
+            except FileNotFoundError:
+                pass
+    finally:
+        if work is not None:
+            shutil.rmtree(work, ignore_errors=True)
+    documents = sum(1 for entry in manifest["documents"] if entry["kind"] != "pdf")
+    return OutputSummary(documents, size, len(unresolved), printed.pdfs if printed else None, printed.error if printed else None)
 
 
 def run_session(argv: list[str], environ: Mapping[str, str], *, src_dir: str = DEFAULT_SRC, out_dir: str = DEFAULT_OUT,
                 work_dir: str = DEFAULT_WORK, scratch_dir: str | None = None, tools_file: str = DEFAULT_TOOLS_FILE,
-                out: IO[str] | None = None, now: datetime | None = None, drop_privileges: bool = True) -> int:
+                out: IO[str] | None = None, now: datetime | None = None, drop_privileges: bool = True,
+                pdf_tool: str = printing.DEFAULT_TOOL) -> int:
     """The whole session. Returns the exit code of ``supervise``: 0 done, 1 failed, 2 started wrongly, 3 limit reached.
 
     ``drop_privileges=False`` never switches the agent to another user, whoever runs this (the tests, which cannot assume
@@ -313,7 +370,9 @@ def run_session(argv: list[str], environ: Mapping[str, str], *, src_dir: str = D
 
     if verdict.word in ("DONE", "LIMIT_REACHED"):
         try:
-            summary = post_step(config, src_dir, out_dir, scratch, load_tools(tools_file), out, now)
+            printer = Printer(pdf_tool, (identity.uid, identity.gid) if identity else None,
+                              DEFAULT_PDF_PARENT if identity else scratch)
+            summary = post_step(config, src_dir, out_dir, scratch, load_tools(tools_file), out, now, printer)
             out.write(summary.line() + "\n")
         except StepFailed as exc:
             verdict = Verdict("FAILED", exc.code, EXIT_FAILED)

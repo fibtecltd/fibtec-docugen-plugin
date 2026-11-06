@@ -14,7 +14,9 @@ Where each fact comes from, and why the model cannot change it:
 - which files a document was derived from is the one thing the agent says: each Markdown document ends with a
   ``## Sources`` section of repository paths, one per line. A path that is not a regular file in the source tree is not
   recorded (and is returned to the caller), so a manifest never claims a provenance the source does not have. A diagram
-  and its rendering take the sources of the Markdown documents that embed them.
+  and its rendering take the sources of the Markdown documents that embed them. A PDF takes the sources of the Markdown
+  documents it was printed from, which the caller says (``pdf_documents``: the box knows what it printed); a PDF it does not
+  mention takes the sources of all documents, never fewer than it may have been derived from.
 
 Standard library only.
 """
@@ -26,6 +28,7 @@ import os
 import re
 import stat
 from dataclasses import dataclass
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 
@@ -41,7 +44,7 @@ _COMMIT = re.compile(r"[0-9a-f]{40}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _MAX_CITED_PER_DOCUMENT = 500
 _MAX_DOCUMENT_BYTES = 5 * 1024 * 1024
-_EXTENSION_KIND = {".md": "markdown", ".mmd": "diagram-source", ".puml": "diagram-source", ".svg": "diagram-svg"}
+_EXTENSION_KIND = {".md": "markdown", ".mmd": "diagram-source", ".puml": "diagram-source", ".svg": "diagram-svg", ".pdf": "pdf"}
 
 
 @dataclass(frozen=True)
@@ -131,8 +134,12 @@ def _embedded_svgs(markdown_path: str, markdown: str) -> set[str]:
 
 
 def build_manifest(out_root: str, src_root: str, source: SourceInfo, *, generator_version: str,
-                   tools: dict[str, str], now: datetime | None = None) -> tuple[dict[str, Any], list[tuple[str, str]]]:
+                   tools: dict[str, str], now: datetime | None = None,
+                   pdf_documents: Mapping[str, tuple[str, ...]] | None = None) -> tuple[dict[str, Any], list[tuple[str, str]]]:
     """The manifest of the documents under ``out_root/docs``, and the citations that could not be recorded.
+
+    ``pdf_documents`` maps the path of a PDF (``docs/pdf/NAME.pdf``) to the Markdown documents it was printed from, as
+    paths relative to ``docs/``.
 
     The second value lists ``(document, cited path)`` for every cited path that is not a regular file in the source tree.
     The manifest is neither serialised nor checked here: ``manifest_bytes`` serialises it, and
@@ -180,9 +187,14 @@ def build_manifest(out_root: str, src_root: str, source: SourceInfo, *, generato
             entries.append({"path": path, "sha256": hashes[path]})
         return entries
 
+    every_source = {path for paths in sources_of.values() for path in paths}
     for rel, doc in documents.items():
         if doc["kind"] == "markdown":
             doc["sources"] = source_entries(sources_of.get(rel, []))
+        elif doc["kind"] == "pdf":
+            printed_from = (pdf_documents or {}).get(rel)
+            doc["sources"] = source_entries(every_source if printed_from is None else
+                                            {path for name in printed_from for path in sources_of.get("docs/" + name, [])})
         else:
             stem = os.path.splitext(rel)[0]
             doc["sources"] = source_entries(inherited.get(stem + ".svg", set()))

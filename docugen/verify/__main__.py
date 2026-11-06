@@ -5,7 +5,8 @@
     python -I -m docugen.verify markdown [--root DIR] FILE_OR_DIR [...]
     python -I -m docugen.verify svg      FILE [FILE ...]
     python -I -m docugen.verify diagram  [--render] FILE [FILE ...]
-    python -I -m docugen.verify tree     DIR [--source DIR]
+    python -I -m docugen.verify tree     DIR [--source DIR] [--allow-pdf]
+    python -I -m docugen.verify pdf      FILE [FILE ...]
 
 Exit status: 0 nothing found, 1 findings, 2 usage or I/O error. ``--json`` prints one JSON array.
 """
@@ -17,12 +18,13 @@ import json
 import os
 import sys
 
-from . import archive_safe, diagram_check, manifest, md_policy, secret_scan, svg_sanitize
+from . import archive_safe, diagram_check, manifest, md_policy, pdf_check, secret_scan, svg_sanitize
 from .common import Finding, read_text_limited
 
 
 MARKDOWN_EXT = (".md",)
 SVG_EXT = (".svg",)
+PDF_EXT = (".pdf",)
 DIAGRAM_EXT = (".mmd", ".mermaid", ".puml", ".plantuml", ".pu")
 
 
@@ -65,6 +67,11 @@ def _run(args: argparse.Namespace) -> list[Finding]:
             with open(p, "rb") as fh:
                 findings.extend(svg_sanitize.check_svg(fh.read(svg_sanitize.MAX_BYTES + 1), p))
         return findings
+    if args.cmd == "pdf":
+        for p in _files(args.paths, PDF_EXT):
+            with open(p, "rb") as fh:
+                findings.extend(pdf_check.check_pdf(fh.read(pdf_check.MAX_BYTES + 1), p))
+        return findings
     if args.cmd == "diagram":
         for p in _files(args.paths, DIAGRAM_EXT):
             found = diagram_check.check_source(read_text_limited(p, diagram_check.MAX_BYTES), p)
@@ -73,13 +80,13 @@ def _run(args: argparse.Namespace) -> list[Finding]:
                 findings.extend(diagram_check.render_check(p))
         return findings
     if args.cmd == "tree":
-        findings.extend(manifest.check_tree(args.paths[0]))
+        findings.extend(manifest.check_tree(args.paths[0], allow_pdf=args.allow_pdf))
         try:
             data = manifest.load_manifest(args.paths[0])
         except (OSError, ValueError) as exc:
             findings.append(Finding("manifest-missing", f"cannot read {manifest.MANIFEST_PATH}: {type(exc).__name__}"))
         else:
-            findings.extend(manifest.check_manifest(data, args.paths[0], args.source))
+            findings.extend(manifest.check_manifest(data, args.paths[0], args.source, allow_pdf=args.allow_pdf))
         return findings
     raise AssertionError(args.cmd)
 
@@ -88,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m docugen.verify", description=__doc__.split("\n\n")[0])
     ap.add_argument("--json", action="store_true", help="print the findings as one JSON array")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("archive", "secrets", "markdown", "svg", "diagram", "tree"):
+    for name in ("archive", "secrets", "markdown", "svg", "diagram", "tree", "pdf"):
         sp = sub.add_parser(name)
         sp.add_argument("paths", nargs="+" if name != "archive" and name != "tree" else 1)
         if name == "markdown":
@@ -97,6 +104,8 @@ def main(argv: list[str] | None = None) -> int:
             sp.add_argument("--render", action="store_true", help="also run mmdc or plantuml")
         if name == "tree":
             sp.add_argument("--source", help="the source tree, to verify the recorded source hashes")
+            sp.add_argument("--allow-pdf", action="store_true",
+                            help="accept the PDFs the box prints under docs/pdf/ (only for a session that asked for them)")
     args = ap.parse_args(argv)
     try:
         findings = _run(args)
