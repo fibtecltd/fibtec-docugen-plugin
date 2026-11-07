@@ -69,6 +69,8 @@ DEFAULT_SRC, DEFAULT_OUT, DEFAULT_WORK = "/workspace/src", "/workspace/out", "/w
 DEFAULT_SCRATCH = "/run/docugen"  # root only; not under /workspace, which the agent can write
 DEFAULT_PDF_PARENT = "/run/docugen-pdf"  # readable by the agent's user: the printer, which runs as that user, reads its input here
 DEFAULT_TOOLS_FILE = "/opt/docugen/etc/tools.json"
+DEFAULT_RELEASE_FILE = "/opt/docugen/etc/release"  # the image's release, written when the image was built (the name its tag has)
+_RELEASE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}")  # what the printer accepts as a version: also the shape of an image tag
 DEFAULT_AGENT_ID = 1001           # the image's user `claude`
 AGENT_NAME, AGENT_HOME = "claude", "/home/claude"
 _SIZE_RULES = frozenset({"archive-too-large", "member-too-large", "too-many-files", "compression-bomb"})
@@ -187,6 +189,21 @@ def load_tools(path: str) -> dict[str, str]:
     return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str) and 0 < len(k) <= 64 and 0 < len(v) <= 64}
 
 
+def load_release(path: str) -> str:
+    """The release of the image that is running, for the manifest and the cover of the combined PDF: what the image recorded when
+    it was built, the name its tag has (``1.1.0``) or ``unreleased`` for a build that is not a release.
+
+    The library's own version when there is no such file or it holds anything but one word of that shape: this is only ever a
+    statement about which build made the documents, so it is the library's version or the image's, never something made up."""
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(257)
+        text = raw.decode("ascii").strip()
+    except (OSError, ValueError):
+        return docugen.__version__
+    return text if len(raw) <= 256 and _RELEASE.fullmatch(text) else docugen.__version__
+
+
 def prepare_scratch(path: str) -> None:
     """Make sure ``path`` is a directory only this process can use, creating it (mode 0700) if needed.
 
@@ -274,11 +291,16 @@ def _source_id(source: SourceInfo) -> str:
 
 
 def post_step(config: SessionConfig, src_dir: str, out_dir: str, scratch_dir: str, tools: dict[str, str],
-              out: IO[str], now: datetime | None = None, printer: Printer | None = None) -> OutputSummary:
+              out: IO[str], now: datetime | None = None, printer: Printer | None = None,
+              release: str | None = None) -> OutputSummary:
     """Check, print PDFs if asked, document the provenance of, pack and upload the output. Raises ``StepFailed``.
+
+    ``release`` is the image's release (``load_release``): the generator's version in the manifest and on the cover of the combined
+    PDF. The version of the library when it is not given.
 
     Writes nothing in ``out_dir``: with PDFs it works on a private copy of the documents, which is removed at the end.
     """
+    version = release or docugen.__version__
     out.write(status.format_status("PACKAGING") + "\n")
     out.flush()
     if check_tree(out_dir):  # the agent's output: no PDF may be in it, whatever was asked for
@@ -295,11 +317,11 @@ def post_step(config: SessionConfig, src_dir: str, out_dir: str, scratch_dir: st
             work = tempfile.mkdtemp(prefix="pdf-", dir=parent)
             printed = printing.print_documents(
                 config.pdf, out_dir, work, source_id=_source_id(config.source), generated_at=moment.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                generator_version=docugen.__version__, tool=printer.tool, user=printer.user, max_output_bytes=MAX_OUTPUT_BYTES)
+                generator_version=version, tool=printer.tool, user=printer.user, max_output_bytes=MAX_OUTPUT_BYTES)
             if printed.stage is not None:
                 tree = printed.stage
         has_pdfs = tree is not out_dir
-        manifest, unresolved = build_manifest(tree, src_dir, config.source, generator_version=docugen.__version__, tools=tools,
+        manifest, unresolved = build_manifest(tree, src_dir, config.source, generator_version=version, tools=tools,
                                               now=moment, pdf_documents=printed.printed_from if has_pdfs and printed else None)
         if not manifest["documents"]:
             raise StepFailed("VALIDATION")  # nothing to deliver
@@ -327,7 +349,7 @@ def post_step(config: SessionConfig, src_dir: str, out_dir: str, scratch_dir: st
 
 def run_session(argv: list[str], environ: Mapping[str, str], *, src_dir: str = DEFAULT_SRC, out_dir: str = DEFAULT_OUT,
                 work_dir: str = DEFAULT_WORK, scratch_dir: str | None = None, tools_file: str = DEFAULT_TOOLS_FILE,
-                out: IO[str] | None = None, now: datetime | None = None, drop_privileges: bool = True,
+                release_file: str = DEFAULT_RELEASE_FILE, out: IO[str] | None = None, now: datetime | None = None, drop_privileges: bool = True,
                 pdf_tool: str = printing.DEFAULT_TOOL) -> int:
     """The whole session. Returns the exit code of ``supervise``: 0 done, 1 failed, 2 started wrongly, 3 limit reached.
 
@@ -372,7 +394,7 @@ def run_session(argv: list[str], environ: Mapping[str, str], *, src_dir: str = D
         try:
             printer = Printer(pdf_tool, (identity.uid, identity.gid) if identity else None,
                               DEFAULT_PDF_PARENT if identity else scratch)
-            summary = post_step(config, src_dir, out_dir, scratch, load_tools(tools_file), out, now, printer)
+            summary = post_step(config, src_dir, out_dir, scratch, load_tools(tools_file), out, now, printer, load_release(release_file))
             out.write(summary.line() + "\n")
         except StepFailed as exc:
             verdict = Verdict("FAILED", exc.code, EXIT_FAILED)
@@ -398,4 +420,5 @@ def main(argv: list[str]) -> int:
 def _main(argv: list[str], env: dict[str, str]) -> int:
     return run_session(argv, env, src_dir=env.get("DOCUGEN_SRC_DIR", DEFAULT_SRC), out_dir=env.get("DOCUGEN_OUT_DIR", DEFAULT_OUT),
                        work_dir=env.get("DOCUGEN_WORK_DIR", DEFAULT_WORK), scratch_dir=env.get("DOCUGEN_SCRATCH_DIR"),
-                       tools_file=env.get("DOCUGEN_TOOLS_FILE", DEFAULT_TOOLS_FILE))
+                       tools_file=env.get("DOCUGEN_TOOLS_FILE", DEFAULT_TOOLS_FILE),
+                       release_file=env.get("DOCUGEN_RELEASE_FILE", DEFAULT_RELEASE_FILE))

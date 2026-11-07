@@ -17,9 +17,10 @@ from typing import Any
 
 import pytest
 
+import docugen
 from docugen.box import session, transfer
 from docugen.box import supervise as supervise_module
-from docugen.box.session import ConfigError, OutputSummary, SessionConfig, StepFailed, load_tools
+from docugen.box.session import ConfigError, OutputSummary, SessionConfig, StepFailed, load_release, load_tools
 from docugen.verify.archive_safe import Limits as RealLimits
 from docugen.verify.manifest import MANIFEST_PATH, check_manifest, check_tree
 from tests.box.test_supervise import FAKE, ROOT, event_assistant, event_result, stream_file, supervisor_env
@@ -175,6 +176,55 @@ def test_the_manifest_records_the_tools_of_the_image(world, tmp_path: Path) -> N
     with tarfile.open(fileobj=io.BytesIO(payload)) as tar:
         manifest = json.loads(tar.extractfile("docs/.docugen/manifest.json").read())  # type: ignore[union-attr]
     assert manifest["generator"]["tools"] == {"mermaid-cli": "12.2.0", "plantuml": "1.2026.9"}
+
+
+def uploaded_manifest(w) -> dict:
+    (_, payload), = w.backend.uploads
+    with tarfile.open(fileobj=io.BytesIO(payload)) as tar:
+        return json.loads(tar.extractfile("docs/.docugen/manifest.json").read())  # type: ignore[union-attr]
+
+
+def test_the_manifest_names_the_release_of_the_image(world, tmp_path: Path) -> None:
+    w = world()
+    release = tmp_path / "release"
+    release.write_text("1.1.0\n")
+    rc, _ = w.run(release_file=str(release))
+    assert rc == 0 and uploaded_manifest(w)["generator"]["version"] == "1.1.0"
+
+
+def test_without_a_release_file_the_manifest_names_the_version_of_the_library(world) -> None:
+    w = world()
+    rc, _ = w.run()
+    assert rc == 0 and uploaded_manifest(w)["generator"]["version"] == docugen.__version__
+
+
+@pytest.mark.parametrize("content, expected", [
+    ("1.1.0\n", "1.1.0"), ("1.1.0", "1.1.0"), ("  1.2.0-rc.1  \n\n", "1.2.0-rc.1"), ("unreleased\n", "unreleased"),
+    ("1.2.0+build.5", "1.2.0+build.5"), ("a" * 64, "a" * 64), ("0", "0"),
+    ("", None), ("\n", None), ("a" * 65, None), ("1.1.0\n1.2.0", None), ("1 .0", None), ("-1", None), (".1", None), ("../x", None),
+    ("1.1.0 # a comment", None), ("v1/1", None), ("1.1.0\x00", None), ("\u00e91.0", None),
+])
+def test_load_release(tmp_path: Path, content: str, expected: str | None) -> None:
+    path = tmp_path / "release"
+    path.write_bytes(content.encode("utf-8"))
+    assert load_release(str(path)) == (expected if expected is not None else docugen.__version__)
+
+
+def test_a_missing_or_unreadable_release_file_is_the_version_of_the_library(tmp_path: Path) -> None:
+    assert load_release(str(tmp_path / "missing")) == docugen.__version__
+    assert load_release(str(tmp_path)) == docugen.__version__     # a directory
+    huge = tmp_path / "huge"
+    huge.write_bytes(b"1.1.0" + b" " * 100_000 + b"x")
+    assert load_release(str(huge)) == docugen.__version__, "only the start of a file is read, and a long one is not a release"
+
+
+def test_the_entry_point_takes_the_release_file_from_the_environment_and_defaults_to_the_images(monkeypatch) -> None:
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(session, "run_session", lambda argv, env, **kw: seen.update(kw) or 0)
+    assert session._main(["claude", "-p", "x"], {"DOCUGEN_RELEASE_FILE": "/somewhere/release"}) == 0
+    assert seen["release_file"] == "/somewhere/release"
+    session._main(["claude", "-p", "x"], {})
+    assert seen["release_file"] == session.DEFAULT_RELEASE_FILE == "/opt/docugen/etc/release"
 
 
 def test_unresolved_citations_are_counted_and_do_not_fail_the_session(world) -> None:

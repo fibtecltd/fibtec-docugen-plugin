@@ -157,7 +157,11 @@ allowed. After the agent has stopped, trusted code does the printing:
 
    `--doc` lists the Markdown documents in reading order: `README.md`, `onboarding.md`, `architecture.md`,
    `api-reference.md`, then any other in path order. `--combined` is `documentation.pdf`; `--single` names the PDF of one
-   document after its path (`guides/setup.md` is `guides-setup.pdf`). All land in `docs/pdf/`.
+   document after its path (`guides/setup.md` is `guides-setup.pdf`). All land in `docs/pdf/`. `--generator-version` is the
+   **release of the image** that is running (the name its tag has, `1.1.0`): it is on the cover of the combined PDF, in the
+   documents' metadata, and is the `generator.version` of the manifest. The image writes it, when it is built, to
+   `/opt/docugen/etc/release` (`DOCUGEN_RELEASE_FILE` moves it); a build that is not a release says `unreleased`; with no such
+   file, or one that holds anything but one word of that shape, the version of this library is used.
 3. Every file it wrote is read back and checked by `pdf_check`. If any is wrong, none is kept.
 4. The manifest lists each PDF as kind `pdf`, with the source files of the documents it was printed from.
 

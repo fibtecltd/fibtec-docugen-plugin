@@ -67,6 +67,7 @@ def test_a_session_that_asked_for_both_delivers_the_documents_and_their_pdfs(wor
     args = json.loads(record.read_text())["args"]
     assert args[args.index("--generated-at") + 1] == manifest["generated_at"] == "2026-11-03T12:00:00Z"
     assert args[args.index("--source-id") + 1] == f"github:{COMMIT}"
+    assert args[args.index("--generator-version") + 1] == manifest["generator"]["version"]   # the cover and the manifest say the same
     assert list(w.work.iterdir()) == []
     assert {str(p.relative_to(w.out)) for p in w.out.rglob("*") if p.is_file()} == {*DOCS, "docs/second.md"}   # nothing written in the agent's tree
 
@@ -160,3 +161,17 @@ def test_the_output_line_with_pdfs() -> None:
     assert OutputSummary(3, 1024, 2).line() == "OUTPUT: documents=3 bytes=1024 unresolved_sources=2"
     assert OutputSummary(3, 1024, 2, 4).line() == "OUTPUT: documents=3 bytes=1024 unresolved_sources=2 pdfs=4"
     assert OutputSummary(3, 1024, 2, 0, "timeout").line() == "OUTPUT: documents=3 bytes=1024 unresolved_sources=2 pdfs=0 pdf_error=timeout"
+
+
+def test_the_printer_and_the_manifest_are_told_the_release_of_the_image(world, tmp_path: Path) -> None:
+    w = world()
+    w.environ["DOCUGEN_PDF"] = "both"
+    release = tmp_path / "release"
+    release.write_text("1.1.0\n")
+    tool, record = make_printer(tmp_path)
+    rc, _ = w.run(pdf_tool=tool, release_file=str(release))
+    assert rc == 0
+    args = json.loads(record.read_text())["args"]
+    assert args[args.index("--generator-version") + 1] == "1.1.0"
+    _, manifest, _ = uploaded(w)
+    assert manifest["generator"]["version"] == "1.1.0"
