@@ -175,8 +175,14 @@ def upload(url: str, fields: Mapping[str, str], path: str, max_bytes: int) -> in
         payload = fh.read(max_bytes + 1)  # never more than one byte over the cap in memory
     if len(payload) > max_bytes:
         raise TransferError(TransferError.TOO_LARGE, f"the output is over {max_bytes} bytes")
+    return post_bytes(url, fields, payload, "docs.tar")
+
+
+def post_bytes(url: str, fields: Mapping[str, str], payload: bytes, filename: str) -> int:
+    """POST ``payload`` as the file ``filename`` to a presigned-POST ``url`` and return its size. The size cap is the caller's (``upload``) or the presigned policy's."""
+    check_url(url)
     boundary = "docugen-" + secrets.token_hex(16)
-    body = encode_multipart(fields, "docs.tar", payload, boundary)
+    body = encode_multipart(fields, filename, payload, boundary)
     request = urllib.request.Request(  # noqa: S310 - the scheme and host were checked above
         url, data=body, method="POST",
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}", "Content-Length": str(len(body))})

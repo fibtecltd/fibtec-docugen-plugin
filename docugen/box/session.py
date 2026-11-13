@@ -19,6 +19,11 @@ fetch or nothing to document), ``TOO_LARGE`` (a size cap), ``VALIDATION`` (the o
 reports ``FAILED`` whatever the agent claimed. A ``LIMIT_REACHED`` session still packs and uploads what it has: whether
 partial output is delivered is the deliver step's decision, not the box's.
 
+Between the agent and the post-step, whatever the agent's verdict, one more upload is tried: the session's spend (``{"cost_usd": X}``,
+from the agent's final event) to a second presigned POST (``DOCUGEN_USAGE_URL``, ``DOCUGEN_USAGE_FIELDS``), when the orchestrator gave
+one. It is advisory in every way: absent or malformed variables, a missing figure and a failed upload print nothing and change neither
+the verdict nor the exit code. The agent never holds the URL (every ``DOCUGEN_*`` variable is removed from its environment).
+
 Between the agent and the terminal line the post-step prints ``STATUS: PACKAGING`` and one line of numbers,
 ``OUTPUT: documents=N bytes=N unresolved_sources=N``. A session that asked for PDFs adds ``pdfs=N``, and ``pdf_error=WORD`` when
 it asked and none was made (``pdf.ERRORS``): the documents are delivered either way.
@@ -99,6 +104,20 @@ class SessionConfig:
     out_fields: dict[str, str]
     source: SourceInfo
     pdf: str = "none"   # none, each, combined or both (pdf.MODES): the orchestrator's choice, never the agent's
+    usage_url: str | None = None                  # where the session's spend goes (a presigned POST), when the orchestrator gave one
+    usage_fields: dict[str, str] | None = None
+
+    @staticmethod
+    def _usage_target(environ: Mapping[str, str]) -> tuple[str | None, dict[str, str] | None]:
+        """The presigned POST for the spend, or (None, None). Advisory: absent or malformed is no upload, never a session that cannot run."""
+        url, raw = environ.get("DOCUGEN_USAGE_URL"), environ.get("DOCUGEN_USAGE_FIELDS")
+        if url is None or raw is None:
+            return None, None
+        try:
+            transfer.check_url(url)
+            return url, transfer.parse_fields(raw)
+        except transfer.TransferError:
+            return None, None
 
     @classmethod
     def from_environ(cls, environ: Mapping[str, str]) -> SessionConfig:
@@ -119,7 +138,8 @@ class SessionConfig:
             pdf = printing.parse_mode(environ.get("DOCUGEN_PDF"))
         except ValueError as exc:
             raise ConfigError(str(exc)) from None
-        return cls(session_id, source_url, out_url, fields, source, pdf)
+        usage_url, usage_fields = cls._usage_target(environ)
+        return cls(session_id, source_url, out_url, fields, source, pdf, usage_url, usage_fields)
 
 
 @dataclass(frozen=True)
@@ -347,6 +367,19 @@ def post_step(config: SessionConfig, src_dir: str, out_dir: str, scratch_dir: st
     return OutputSummary(documents, size, len(unresolved), printed.pdfs if printed else None, printed.error if printed else None)
 
 
+def upload_usage(config: SessionConfig, result: dict[str, Any] | None) -> None:
+    """Tell the service what the session cost, when there is somewhere to say it and a figure to say. Best effort: nothing is printed and nothing
+    changes the session, whatever happens here. The record is built in memory from the agent's final event (a number from ``supervise.cost_record``)."""
+    if config.usage_url is None or config.usage_fields is None or result is None:
+        return
+    try:
+        record = supervise.cost_record(result)
+        if record is not None:
+            transfer.post_bytes(config.usage_url, config.usage_fields, record, "usage.json")
+    except Exception:  # noqa: BLE001 - advisory: no failure here may cost a session its documents, and nothing of it is printed
+        return
+
+
 def run_session(argv: list[str], environ: Mapping[str, str], *, src_dir: str = DEFAULT_SRC, out_dir: str = DEFAULT_OUT,
                 work_dir: str = DEFAULT_WORK, scratch_dir: str | None = None, tools_file: str = DEFAULT_TOOLS_FILE,
                 release_file: str = DEFAULT_RELEASE_FILE, out: IO[str] | None = None, now: datetime | None = None, drop_privileges: bool = True,
@@ -389,6 +422,8 @@ def run_session(argv: list[str], environ: Mapping[str, str], *, src_dir: str = D
         return EXIT_USAGE
     except Exception:  # noqa: BLE001 - see above
         return supervise.finish(out, Verdict("FAILED", "INTERNAL", EXIT_FAILED), None)
+
+    upload_usage(config, result)  # whatever the verdict, and before the post-step: the agent has spent what it spent
 
     if verdict.word in ("DONE", "LIMIT_REACHED"):
         try:
