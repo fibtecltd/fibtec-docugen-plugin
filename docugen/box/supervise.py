@@ -86,17 +86,33 @@ def decide(returncode: int, result: dict[str, Any] | None) -> Verdict:
     return _failed("INTERNAL")  # the contract asks for DONE or FAILED <code> as the last line
 
 
+def _number(value: Any) -> int | float | None:
+    """``value`` if it is a plain, finite number from 0 up to (not including) 1e12, else None: the only kind of figure that leaves the box."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or not 0 <= value < 1e12:
+        return None
+    return value
+
+
 def usage_line(result: dict[str, Any]) -> str | None:
     parts = []
     for key, label, fmt in (("num_turns", "turns", "%d"), ("total_cost_usd", "cost_usd", "%.4f"),
                             ("duration_ms", "duration_ms", "%d")):
-        value = result.get(key)
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            continue
-        if not math.isfinite(value) or not 0 <= value < 1e12:
+        value = _number(result.get(key))
+        if value is None:
             continue
         parts.append(f"{label}=" + fmt % value)
     return "USAGE: " + " ".join(parts) if parts else None
+
+
+def cost_record(result: dict[str, Any]) -> bytes | None:
+    """What the box tells the service about a session's spend: ``{"cost_usd":X}`` (four places) from the agent's final event, or None when
+    the event has no acceptable figure (the rule of ``usage_line``). A number, never text."""
+    value = _number(result.get("total_cost_usd"))
+    if value is None:
+        return None
+    return json.dumps({"cost_usd": round(float(value), 4)}, separators=(",", ":")).encode("ascii")
 
 
 class _Relay:

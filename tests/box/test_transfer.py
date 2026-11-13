@@ -236,6 +236,25 @@ def test_upload_posts_the_fields_first_and_the_file_last(tmp_path: Path) -> None
     assert parts[-1] == ("file", parts[-1][1]) and payload in body and body.count(payload) == 1
 
 
+def test_the_file_is_named_docs_tar_by_upload_and_by_the_caller_in_post_bytes(tmp_path: Path) -> None:
+    path = tmp_path / "f"
+    path.write_bytes(b"x")
+    with serve(lambda h, b: reply(h, 204)) as (base, hits):
+        transfer.upload(f"{base}/", {"key": "k"}, str(path), 100)
+        assert transfer.post_bytes(f"{base}/", {"key": "k"}, b'{"cost_usd":0.5}', "usage.json") == 16
+    (_, _, first, _), (_, _, second, headers) = hits.requests
+    assert b'name="file"; filename="docs.tar"' in first and b'name="file"; filename="usage.json"' in second
+    parts = parse_multipart(headers["content-type"], second)
+    assert [name for name, _ in parts] == ["key", "file"] and parts[-1][1] == b'{"cost_usd":0.5}'
+
+
+@pytest.mark.parametrize("url", ["http://evil.example/", "ftp://127.0.0.1/", "https://example.com/", "file:///etc/passwd", ""])
+def test_post_bytes_refuses_a_url_it_would_not_talk_to_before_connecting(url: str) -> None:
+    with pytest.raises(TransferError) as exc:
+        transfer.post_bytes(url, {"key": "k"}, b"x", "usage.json")
+    assert exc.value.code == TransferError.BAD_URL
+
+
 def test_each_upload_has_its_own_boundary(tmp_path: Path) -> None:
     path = tmp_path / "f"
     path.write_bytes(b"x")

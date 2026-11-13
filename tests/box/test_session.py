@@ -50,12 +50,28 @@ def tar_bytes(files: dict[str, str]) -> bytes:
 class Backend:
     """Serves the source and records what is uploaded."""
 
-    def __init__(self, source: bytes, source_status: int = 200, upload_status: int = 204) -> None:
-        self.source, self.source_status, self.upload_status = source, source_status, upload_status
+    def __init__(self, source: bytes, source_status: int = 200, upload_status: int = 204, usage_status: int = 204) -> None:
+        self.source, self.source_status, self.upload_status, self.usage_status = source, source_status, upload_status, usage_status
         self.uploads: list[tuple[dict[str, str], bytes]] = []
+        self.usage_uploads: list[tuple[dict[str, str], bytes]] = []       # what was posted to /usage, apart from the output
+        self.usage_bodies: list[bytes] = []                                 # the same, whole, for the file's name
+        self.order: list[str] = []                                          # "usage" and "docs", in the order they arrived
+        self.agent_had_ended: list[bool] = []                               # at each usage post: had the agent already run and left?
+        self.probe: Callable[[], bool] | None = None
         self.gets = 0
 
     def __call__(self, handler: BaseHTTPRequestHandler, body: bytes) -> None:
+        if handler.command == "POST" and handler.path.startswith("/usage"):
+            self.order.append("usage")
+            if self.probe is not None:
+                self.agent_had_ended.append(self.probe())
+            if self.usage_status == 204:
+                self.usage_bodies.append(body)
+                parts = parse_multipart(handler.headers["Content-Type"], body)
+                self.usage_uploads.append(({k: v.decode() for k, v in parts[:-1]}, parts[-1][1]))
+            return reply(handler, self.usage_status)
+        if handler.command == "POST":
+            self.order.append("docs")
         if handler.command == "GET":
             self.gets += 1
             return reply(handler, self.source_status, self.source if self.source_status == 200 else b"<Error/>")
@@ -100,12 +116,17 @@ def world(tmp_path: Path):
     """A World against a backend that serves a good source; ``make(backend)`` swaps in another."""
     contexts: list[Any] = []
 
-    def make(backend: Backend | None = None) -> World:
+    def make(backend: Backend | None = None, sub: str | None = None) -> World:
+        """``sub`` names a directory of its own, for a second world in the same test (a session to compare with)."""
         backend = backend or Backend(tar_bytes(SOURCE_FILES))
         context = serve(backend)
         base, _hits = context.__enter__()
         contexts.append(context)
-        w = World(tmp_path, backend, base)
+        home = tmp_path
+        if sub is not None:
+            home = tmp_path / sub
+            home.mkdir()
+        w = World(home, backend, base)
         w.stream([event_assistant("STATUS: DRAFTING"), event_result("STATUS: DONE")])
         return w
 
@@ -243,6 +264,155 @@ def test_a_zip_source_is_accepted_too(world) -> None:
     w = world(Backend(buf.getvalue()))
     rc, lines = w.run()
     assert rc == 0 and lines[-1] == "STATUS: DONE" and (w.src / "README.md").exists()
+
+
+# ── the session's spend ─────────────────────────────────────────────────────────────────────────────
+
+USAGE_SECRET = "USAGESIGNATURE9876543210"
+USAGE_KEY = f"out/t/{SESSION_ID}/usage.json"
+
+
+def with_usage(w: World, **change: str) -> World:
+    """Give the session somewhere to say what it cost: a second presigned POST, on the same loopback backend."""
+    w.environ.update({"DOCUGEN_USAGE_URL": f"{w.base}/usage", "DOCUGEN_USAGE_FIELDS": json.dumps({"key": USAGE_KEY, "policy": USAGE_SECRET}), **change})
+    return w
+
+
+def test_a_good_session_tells_the_service_what_it_cost_and_nothing_else_changes(world) -> None:
+    plain = world(sub="plain")
+    plain_rc, plain_lines = plain.run()
+    w = with_usage(world())
+    rc, lines = w.run()
+    assert (rc, lines) == (plain_rc, plain_lines)              # not a line more, not another exit code
+    (fields, payload), = w.backend.usage_uploads
+    assert fields == {"key": USAGE_KEY, "policy": USAGE_SECRET} and payload == b'{"cost_usd":0.0123}'
+    assert b'name="file"; filename="usage.json"' in w.backend.usage_bodies[0]
+    assert len(w.backend.uploads) == 1 and w.backend.uploads[0][0]["key"].endswith("/docs.tar")   # the output went where it always goes
+    assert list(w.work.iterdir()) == [] and plain.backend.usage_uploads == []                      # no file left; no variables, no upload
+
+
+def test_the_spend_is_told_after_the_agent_has_ended_and_before_the_documents_are_packed(world) -> None:
+    w = with_usage(world())
+    w.backend.probe = lambda: w.record.exists()               # the fake agent writes its record when it runs
+    w.run()
+    assert w.backend.order == ["usage", "docs"] and w.backend.agent_had_ended == [True]
+
+
+@pytest.mark.parametrize("events,agent_exit,words", [
+    ([event_assistant("STATUS: DRAFTING"), event_result("", is_error=True, subtype="error_max_turns", terminal_reason="max_turns")], 1, "LIMIT_REACHED"),
+    ([event_assistant("STATUS: INDEXED"), event_result("STATUS: FAILED NO_SOURCE")], 0, "FAILED NO_SOURCE"),
+    ([event_result("STATUS: DONE", is_error=True, terminal_reason="api_error", api_error_status=429)], 1, "FAILED BUDGET"),
+])
+def test_a_session_that_did_not_end_well_has_still_spent_what_it_spent(world, events: list, agent_exit: int, words: str) -> None:
+    w = with_usage(world())
+    w.stream(events, agent_exit)
+    _, lines = w.run()
+    assert lines[-1] == f"STATUS: {words}" and [p for _, p in w.backend.usage_uploads] == [b'{"cost_usd":0.0123}']
+
+
+def test_a_session_whose_agent_never_ended_has_no_figure_to_tell(world) -> None:
+    w = with_usage(world())
+    w.stream([event_assistant("STATUS: DONE")], 0)            # no final event: a crash
+    _, lines = w.run()
+    assert lines[-1] == "STATUS: FAILED INTERNAL" and w.backend.usage_uploads == []
+
+
+@pytest.mark.parametrize("figure", [None, float("inf"), float("nan"), -0.5, True, "0.5", 1e12, [1], {"a": 1}])
+def test_a_figure_that_is_not_a_plain_number_is_not_told(world, figure: object) -> None:
+    w = with_usage(world())
+    w.stream([event_assistant("STATUS: DRAFTING"), event_result("STATUS: DONE", total_cost_usd=figure)])
+    rc, lines = w.run()
+    assert rc == 0 and lines[-1] == "STATUS: DONE" and w.backend.usage_uploads == []
+
+
+@pytest.mark.parametrize("figure,expected", [(0, b'{"cost_usd":0.0}'), (1, b'{"cost_usd":1.0}'), (0.123456, b'{"cost_usd":0.1235}'),
+                                             (12.5, b'{"cost_usd":12.5}'), (999999999999.0, b'{"cost_usd":999999999999.0}')])
+def test_the_figure_is_a_number_to_four_places(world, figure: float, expected: bytes) -> None:
+    w = with_usage(world())
+    w.stream([event_assistant("STATUS: DRAFTING"), event_result("STATUS: DONE", total_cost_usd=figure)])
+    w.run()
+    assert [p for _, p in w.backend.usage_uploads] == [expected]
+
+
+@pytest.mark.parametrize("change", [
+    {"DOCUGEN_USAGE_URL": "ftp://127.0.0.1/usage"},                                  # not https, not loopback http
+    {"DOCUGEN_USAGE_URL": "https://example.com/usage"},                              # not an amazonaws.com name
+    {"DOCUGEN_USAGE_FIELDS": "not json"},
+    {"DOCUGEN_USAGE_FIELDS": "[]"},
+    {"DOCUGEN_USAGE_FIELDS": "{}"},
+    {"DOCUGEN_USAGE_FIELDS": json.dumps({"file": "x"})},                             # a field called file is the file
+])
+def test_malformed_usage_variables_upload_nothing_and_do_not_stop_the_session(world, change: dict) -> None:
+    plain_rc, plain_lines = world(sub="plain").run()
+    w = with_usage(world(), **change)
+    rc, lines = w.run()
+    assert (rc, lines) == (plain_rc, plain_lines) and w.backend.usage_uploads == [] and w.backend.order == ["docs"]
+
+
+@pytest.mark.parametrize("only", ["DOCUGEN_USAGE_URL", "DOCUGEN_USAGE_FIELDS"])
+def test_half_a_usage_target_uploads_nothing(world, only: str) -> None:
+    w = with_usage(world())
+    for name in ("DOCUGEN_USAGE_URL", "DOCUGEN_USAGE_FIELDS"):
+        if name != only:
+            del w.environ[name]
+    rc, _ = w.run()
+    assert rc == 0 and w.backend.usage_uploads == [] and w.backend.order == ["docs"]
+
+
+@pytest.mark.parametrize("status", [403, 412, 500, 302])
+def test_a_refused_spend_upload_changes_nothing(world, status: int) -> None:
+    plain_rc, plain_lines = world(sub="plain").run()
+    w = with_usage(world(Backend(tar_bytes(SOURCE_FILES), usage_status=status)))
+    rc, lines = w.run()
+    assert (rc, lines) == (plain_rc, plain_lines) and len(w.backend.uploads) == 1 and w.backend.usage_uploads == []
+
+
+@pytest.mark.parametrize("where", ["record", "post"])
+def test_an_exception_while_telling_the_spend_changes_nothing_and_prints_nothing(world, monkeypatch: pytest.MonkeyPatch,
+                                                                              capsys: pytest.CaptureFixture[str], where: str) -> None:
+    plain_rc, plain_lines = world(sub="plain").run()
+    capsys.readouterr()
+    w = with_usage(world())
+
+    def explode(*_a: object, **_k: object) -> None:
+        raise RuntimeError(f"/workspace/src/secret-customer-file.py {USAGE_SECRET}")
+
+    real_post = transfer.post_bytes
+
+    def post(url: str, fields: dict, payload: bytes, filename: str) -> int:
+        if filename == "usage.json":
+            explode()
+        return real_post(url, fields, payload, filename)      # the output still goes through the same function
+
+    if where == "record":
+        monkeypatch.setattr(supervise_module, "cost_record", explode)
+    else:
+        monkeypatch.setattr(transfer, "post_bytes", post)
+    rc, lines = w.run()
+    captured = capsys.readouterr()
+    assert (rc, lines) == (plain_rc, plain_lines) and captured.err == "" and captured.out == ""
+    assert USAGE_SECRET not in "".join(lines) and len(w.backend.uploads) == 1 and w.backend.usage_uploads == []
+
+
+def test_the_agent_never_holds_the_spend_target(world) -> None:
+    w = with_usage(world())
+    w.run()
+    names = json.loads(w.record.read_text())["env"]
+    assert not [n for n in names if n.startswith("DOCUGEN_")] and w.record.read_text().count(USAGE_SECRET) == 0
+
+
+def test_the_config_reads_the_spend_target_and_forgives_its_absence_and_its_faults() -> None:
+    base = {"DOCUGEN_SESSION_ID": SESSION_ID, "DOCUGEN_SOURCE_URL": "https://b.s3.eu-west-1.amazonaws.com/s?sig=1",
+            "DOCUGEN_OUT_URL": "https://b.s3.eu-west-1.amazonaws.com/", "DOCUGEN_OUT_FIELDS": '{"key": "k"}',
+            "DOCUGEN_SOURCE_KIND": "zip", "DOCUGEN_SOURCE_ARCHIVE_SHA256": "ab" * 32}
+    assert SessionConfig.from_environ(base).usage_url is None and SessionConfig.from_environ(base).usage_fields is None
+    good = {**base, "DOCUGEN_USAGE_URL": "https://b.s3.eu-west-1.amazonaws.com/", "DOCUGEN_USAGE_FIELDS": '{"key": "u"}'}
+    config = SessionConfig.from_environ(good)
+    assert config.usage_url == "https://b.s3.eu-west-1.amazonaws.com/" and config.usage_fields == {"key": "u"}
+    assert config.out_fields == {"key": "k"}                                     # the output's own target is untouched
+    for broken in ({"DOCUGEN_USAGE_FIELDS": "nope"}, {"DOCUGEN_USAGE_URL": "http://evil.example/"}):
+        config = SessionConfig.from_environ({**good, **broken})
+        assert (config.usage_url, config.usage_fields) == (None, None) and config.session_id == SESSION_ID
 
 
 # ── how the agent ended ─────────────────────────────────────────────────────────────────────────────

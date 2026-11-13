@@ -245,6 +245,27 @@ def test_usage_line_takes_numbers_only(tmp_path: Path) -> None:
     assert lines == ["USAGE: turns=0 cost_usd=0.0000 duration_ms=3", "STATUS: DONE"]
 
 
+@pytest.mark.parametrize("figure,expected", [
+    (0, b'{"cost_usd":0.0}'), (0.0123, b'{"cost_usd":0.0123}'), (1, b'{"cost_usd":1.0}'), (0.123456, b'{"cost_usd":0.1235}'),
+    (12.5, b'{"cost_usd":12.5}'), (123456789.0, b'{"cost_usd":123456789.0}'),
+])
+def test_cost_record_is_one_number(figure: float, expected: bytes) -> None:
+    assert supervise.cost_record({"total_cost_usd": figure}) == expected
+
+
+@pytest.mark.parametrize("result", [
+    {}, {"total_cost_usd": None}, {"total_cost_usd": True}, {"total_cost_usd": False}, {"total_cost_usd": "0.5"}, {"total_cost_usd": float("inf")},
+    {"total_cost_usd": float("nan")}, {"total_cost_usd": -0.01}, {"total_cost_usd": 1e12}, {"total_cost_usd": [1]}, {"num_turns": 3, "duration_ms": 5},
+])
+def test_cost_record_is_none_without_a_plain_figure(result: dict) -> None:
+    assert supervise.cost_record(result) is None
+
+
+def test_cost_record_carries_the_cost_and_nothing_the_agent_could_have_written() -> None:
+    record = supervise.cost_record({"total_cost_usd": 0.5, "result": "STATUS: DONE; rm -rf /", "num_turns": 9, "duration_ms": 7, "x": "y"})
+    assert record == b'{"cost_usd":0.5}' and record.isascii()
+
+
 # ── how the agent is started ────────────────────────────────────────────────────────────────────────
 
 def test_output_format_is_forced_and_the_caller_cannot_override_it(tmp_path: Path) -> None:

@@ -139,6 +139,14 @@ does not have. A diagram and its rendering take the sources of the Markdown docu
 Between the agent and the terminal line it prints `STATUS: PACKAGING` and `OUTPUT: documents=N bytes=N unresolved_sources=N`
 (with ` pdfs=N`, and ` pdf_error=WORD`, for a session that asked for PDFs; `documents` does not count them).
 
+**The session's spend.** When the environment also holds `DOCUGEN_USAGE_URL` and `DOCUGEN_USAGE_FIELDS` (a second presigned
+POST, for one object of a kilobyte at most), the box tells the service what the agent cost: right after the agent ends,
+whatever its verdict and before the post-step, it posts `{"cost_usd":X}` (the agent's `total_cost_usd`, four places, only a
+plain finite number from 0 up to 1e12) as the file `usage.json`. It is **advisory in every way**: absent or malformed
+variables, a figure that is missing or not a number, a refused upload and any exception print nothing and change neither the
+verdict nor the exit code; and the agent, which never holds a `DOCUGEN_*` variable, cannot reach the URL. The service treats
+the number as a claim (the box is untrusted) and bounds it; see `fibtec-docugen`'s Iron Triangle design.
+
 ### PDFs: `docugen/box/pdf.py`
 
 `DOCUGEN_PDF` (`none`, the default when it is absent, `each`, `combined` or `both`) is the orchestrator's choice and, like
